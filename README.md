@@ -129,6 +129,13 @@ Set `AUDIBLE_REGION` to the marketplace you buy from (`us` by default).
 Audible's catalog is region-specific and an ASIN from one marketplace usually
 won't resolve in another, so this should match your library.
 
+The image is published by the `release-audible` workflow, which runs on
+`workflow_dispatch` or an `audible-v*` tag and pushes to this repository's own
+package registry. It authenticates with `GITHUB_TOKEN`, so no access token or
+local `docker login` is needed. (Upstream publishes its own images manually via
+the `release-*` Makefile targets; `make release-ab` still works if you'd rather
+build locally.)
+
 Two things are worth understanding before using it:
 
 **Audible has no concept of a "work".** Every ASIN is one narration in one
