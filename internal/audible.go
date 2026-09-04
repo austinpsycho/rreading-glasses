@@ -8,6 +8,7 @@ import (
 	"iter"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,6 +25,13 @@ type ABGetter struct {
 	cache  cache[[]byte]
 	client *AudibleClient
 	ids    *IDMapper
+
+	// authors caches author detail so mapping a book doesn't cost an upstream
+	// request per contributor -- a bulk load pulls many books by one author,
+	// and getters aren't allowed to write to the shared cache. Bounded by the
+	// number of distinct authors in a library, which is small.
+	authorMu sync.RWMutex
+	authors  map[string]*audnexusAuthor
 }
 
 var (
@@ -33,7 +41,12 @@ var (
 
 // NewAudibleGetter returns a new getter backed by Audible.
 func NewAudibleGetter(cache cache[[]byte], client *AudibleClient, ids *IDMapper) (*ABGetter, error) {
-	return &ABGetter{cache: cache, client: client, ids: ids}, nil
+	return &ABGetter{
+		cache:   cache,
+		client:  client,
+		ids:     ids,
+		authors: map[string]*audnexusAuthor{},
+	}, nil
 }
 
 // searchLimit caps how many results we return for one query. Each result is
@@ -197,6 +210,30 @@ func (g *ABGetter) workResource(ctx context.Context, asin string) (workResource,
 	return g.mapBook(ctx, book)
 }
 
+// authorDetail returns an author's name, image and bio, fetching each ASIN at
+// most once. A failed lookup is cached as nil so a book by an author audnexus
+// doesn't know about doesn't retry on every subsequent mapping.
+func (g *ABGetter) authorDetail(ctx context.Context, asin string) *audnexusAuthor {
+	g.authorMu.RLock()
+	author, ok := g.authors[asin]
+	g.authorMu.RUnlock()
+	if ok {
+		return author
+	}
+
+	author, err := g.client.GetAuthor(ctx, asin)
+	if err != nil {
+		Log(ctx).Debug("no author detail", "asin", asin, "err", err)
+		author = nil
+	}
+
+	g.authorMu.Lock()
+	g.authors[asin] = author
+	g.authorMu.Unlock()
+
+	return author
+}
+
 // mapBook translates an audnexus book into the client's work schema.
 func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResource, error) {
 	authASIN := authorASIN(book.Authors)
@@ -282,9 +319,22 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 	authorRsc := AuthorResource{
 		ForeignID:   authorID,
 		Name:        book.Authors[0].Name,
-		Description: "N/A", // Filled in by GetAuthor; not worth a request here.
+		Description: "N/A", // Must be set.
 		URL:         audibleURL(authASIN),
 		Series:      series,
+	}
+
+	// The client renders the author embedded in a work, so search results show
+	// this rather than whatever GetAuthor later returns. Leaving it as a stub
+	// makes every author look empty in search.
+	if detail := g.authorDetail(ctx, authASIN); detail != nil {
+		if detail.Name != "" {
+			authorRsc.Name = detail.Name
+		}
+		if detail.Description != "" {
+			authorRsc.Description = detail.Description
+		}
+		authorRsc.ImageURL = detail.Image
 	}
 
 	workRsc := workResource{
@@ -351,12 +401,12 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 
 	Log(ctx).Debug("getting author", "authorID", authorID, "asin", asin)
 
-	author, err := g.client.GetAuthor(ctx, asin)
-	if err != nil {
-		return nil, fmt.Errorf("getting author %s: %w", asin, err)
+	author := g.authorDetail(ctx, asin)
+	if author == nil {
+		return nil, errors.Join(errNotFound, fmt.Errorf("no detail for author %s", asin))
 	}
 
-	products, _, err := g.client.ProductsByAuthor(ctx, author.Name, 1)
+	products, _, err := g.client.ProductsByAuthor(ctx, author.Name, 0)
 	if err != nil {
 		return nil, fmt.Errorf("getting author products: %w", err)
 	}
@@ -414,7 +464,11 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 
 		seen := map[string]bool{}
 
-		for page := 1; ; page++ {
+		// Audible's page parameter is 0-indexed: page=1 skips the first
+		// num_results items. Starting at 1 silently drops an author's first
+		// page of books, and returns nothing at all for authors with fewer
+		// than num_results titles.
+		for page := 0; ; page++ {
 			products, total, err := g.client.ProductsByAuthor(ctx, author.Name, page)
 			if err != nil {
 				Log(ctx).Warn("problem getting author products", "asin", asin, "page", page, "err", err)
@@ -440,7 +494,7 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 				}
 			}
 
-			if page*audiblePageSize >= total {
+			if (page+1)*audiblePageSize >= total {
 				return
 			}
 		}

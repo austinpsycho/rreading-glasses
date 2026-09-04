@@ -19,6 +19,16 @@ func newTestAudibleGetter(t *testing.T) *ABGetter {
 	g, err := NewAudibleGetter(cache, NewAudibleClient("api.audnex.us", "api.audible.com", "us"), ids)
 	require.NoError(t, err)
 
+	// Seed author detail so mapping doesn't reach the network. A nil entry is
+	// a cached miss, which is what an author audnexus doesn't know looks like.
+	g.authors["B001IGFHW6"] = &audnexusAuthor{
+		ASIN:        "B001IGFHW6",
+		Name:        "Brandon Sanderson",
+		Description: "Epic fantasy author.",
+		Image:       "https://m.media-amazon.com/images/I/author.jpg",
+	}
+	g.authors["B0UNKNOWN1"] = nil
+
 	return g
 }
 
@@ -87,6 +97,40 @@ func TestAudibleBookDataIntegrity(t *testing.T) {
 	for _, field := range []string{"Books", "Authors", "Series", "Genres", "RelatedWorks"} {
 		assert.NotNil(t, raw[field], "%s must not be null", field)
 	}
+}
+
+// TestAudibleEmbeddedAuthor covers the author embedded in a work. The client
+// renders this in search results rather than what GetAuthor returns, so a stub
+// here makes every author show up blank.
+func TestAudibleEmbeddedAuthor(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	work, err := g.mapBook(ctx, testBook(testASIN(t)))
+	require.NoError(t, err)
+
+	author := work.Authors[0]
+	assert.Equal(t, "Brandon Sanderson", author.Name)
+	assert.Equal(t, "Epic fantasy author.", author.Description)
+	assert.Equal(t, "https://m.media-amazon.com/images/I/author.jpg", author.ImageURL)
+}
+
+// TestAudibleEmbeddedAuthorUnknown covers an author audnexus has no record of.
+// The work still has to be usable, and Description must not be empty.
+func TestAudibleEmbeddedAuthorUnknown(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	book := testBook(testASIN(t))
+	book.Authors = []audnexusPerson{{ASIN: "B0UNKNOWN1", Name: "Obscure Author"}}
+
+	work, err := g.mapBook(ctx, book)
+	require.NoError(t, err)
+
+	author := work.Authors[0]
+	assert.Equal(t, "Obscure Author", author.Name)
+	assert.Equal(t, "N/A", author.Description)
+	assert.Empty(t, author.ImageURL)
 }
 
 func TestAudibleBookMapping(t *testing.T) {
