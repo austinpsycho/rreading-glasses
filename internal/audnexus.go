@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -163,21 +164,68 @@ func newThrottledClient(rate int) *http.Client {
 	return &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: throttledTransport{
-			ticker:       time.NewTicker(time.Second / time.Duration(rate)),
-			RoundTripper: errorProxyTransport{http.DefaultTransport},
+			ticker: time.NewTicker(time.Second / time.Duration(rate)),
+			// Deliberately not errorProxyTransport: it turns any >=400 into an
+			// error and drops the response, which would hide both the status
+			// and the Retry-After header that the retry below needs.
+			RoundTripper: http.DefaultTransport,
 		},
 	}
 }
 
+// maxRetries bounds how many times a rate-limited request is retried before
+// giving up. Without this a 429 drops the book entirely, which during a
+// library import means silently missing entries rather than a slow one.
+const maxRetries = 4
+
+// maxBackoff caps how long a single attempt will wait. An upstream asking for
+// several minutes is better handled by failing this book and letting the
+// client retry than by pinning a goroutine.
+const maxBackoff = 30 * time.Second
+
 func (c *AudibleClient) get(ctx context.Context, client *http.Client, url string, out any) error {
+	for attempt := 0; ; attempt++ {
+		body, err := c.attempt(ctx, client, url, attempt)
+
+		var retry retryableErr
+		if errors.As(err, &retry) && attempt < maxRetries {
+			Log(ctx).Debug("backing off", "url", url, "wait", retry.after, "attempt", attempt)
+			select {
+			case <-time.After(retry.after):
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		if err != nil {
+			return err
+		}
+
+		if err := json.Unmarshal(body, out); err != nil {
+			return fmt.Errorf("decoding %s: %w", url, err)
+		}
+		return nil
+	}
+}
+
+// retryableErr marks a response worth retrying, and how long to wait first.
+type retryableErr struct {
+	after time.Duration
+	err   error
+}
+
+func (e retryableErr) Error() string { return e.err.Error() }
+func (e retryableErr) Unwrap() error { return e.err }
+
+func (c *AudibleClient) attempt(ctx context.Context, client *http.Client, url string, attempt int) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return fmt.Errorf("building request: %w", err)
+		return nil, fmt.Errorf("building request: %w", err)
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("requesting %s: %w", url, err)
+		return nil, fmt.Errorf("requesting %s: %w", url, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -185,23 +233,39 @@ func (c *AudibleClient) get(ctx context.Context, client *http.Client, url string
 	case resp.StatusCode == http.StatusNotFound:
 		// audnexus returns 404 both for unknown ASINs and for ASINs that exist
 		// in another marketplace. Neither is retryable for us.
-		return errors.Join(errNotFound, fmt.Errorf("not found: %s", url))
-	case resp.StatusCode == http.StatusTooManyRequests:
-		return fmt.Errorf("rate limited by %s", url)
+		return nil, errors.Join(errNotFound, fmt.Errorf("not found: %s", url))
+
+	case resp.StatusCode == http.StatusTooManyRequests,
+		resp.StatusCode == http.StatusServiceUnavailable:
+		return nil, retryableErr{
+			after: backoff(resp, attempt),
+			err: errors.Join(statusErr(resp.StatusCode),
+				fmt.Errorf("rate limited by %s", url)),
+		}
+
 	case resp.StatusCode >= 300:
-		return fmt.Errorf("unexpected status %d from %s", resp.StatusCode, url)
+		return nil, fmt.Errorf("unexpected status %d from %s", resp.StatusCode, url)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("reading response: %w", err)
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	return body, nil
+}
+
+// backoff honors Retry-After when the upstream sends one, and otherwise waits
+// a second with jitter so that concurrent refreshes don't retry in lockstep.
+func backoff(resp *http.Response, attempt int) time.Duration {
+	if v := resp.Header.Get("Retry-After"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			return min(time.Duration(secs)*time.Second, maxBackoff)
+		}
 	}
 
-	if err := json.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("decoding %s: %w", url, err)
-	}
-
-	return nil
+	wait := time.Duration(1<<attempt) * time.Second
+	wait += time.Duration(rand.Int64N(int64(500 * time.Millisecond)))
+	return min(wait, maxBackoff)
 }
 
 // GetBook fetches a single book from audnexus.
