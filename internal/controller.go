@@ -136,6 +136,13 @@ type getter interface {
 	Recommendations(ctx context.Context, page int64) (RecommentationsResource, error)
 }
 
+// asinLookup is an optional getter extension for upstreams that key their
+// catalog by ASIN and can therefore resolve one without having loaded the
+// edition first. Getters that don't implement it fall back to a cache lookup.
+type asinLookup interface {
+	LookupASIN(ctx context.Context, asin string) (int64, error)
+}
+
 // NewUpstream creates a new http.Client with middleware appropriate for use
 // with an upstream.
 func NewUpstream(host string, proxy string) (*http.Client, error) {
@@ -358,6 +365,12 @@ func (c *Controller) GetASIN(ctx context.Context, asin string) (int64, error) {
 func (c *Controller) getASIN(ctx context.Context, asin string) (int64, error) {
 	bytes, ok := c.cache.Get(ctx, asinKey(asin))
 	if !ok {
+		// Goodreads and Hardcover only know an ASIN once the edition carrying
+		// it has been loaded, so a miss is terminal for them. An upstream
+		// keyed by ASIN can resolve one directly instead.
+		if lookup, ok := c.getter.(asinLookup); ok {
+			return lookup.LookupASIN(ctx, asin)
+		}
 		return 0, errNotFound
 	}
 

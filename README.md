@@ -97,8 +97,9 @@ differences between the two.
 
 A Postgres backend (any version) is required.
 
-Two docker compose example files are included as a reference:
-`docker-compose-gr.yml` and `docker-compose-hardcover.yml`.
+Three docker compose example files are included as a reference:
+`docker-compose-gr.yml`, `docker-compose-hardcover.yml` and
+`docker-compose-audible.yml`.
 
 The app will use as much memory as it has available for in-memory caching, so
 it's recommended to run the container with a `--memory` limit or similar.
@@ -115,6 +116,44 @@ When using Hardcover you must set the `hardcover-auth` parameter.
 
 Note that your API key **will expire every year on January 1**, so you'll need
 to periodically regenerate it.
+
+### Audible
+
+The `audible` image serves audiobook metadata sourced from Audible. It needs no
+credentials. Book and author detail come from [audnexus], which is the same
+source Audiobookshelf uses, so matches stay consistent between the two;
+search goes to Audible's catalog API, because audnexus only resolves ASINs and
+has no book search of its own.
+
+Set `AUDIBLE_REGION` to the marketplace you buy from (`us` by default).
+Audible's catalog is region-specific and an ASIN from one marketplace usually
+won't resolve in another, so this should match your library.
+
+Two things are worth understanding before using it:
+
+**Audible has no concept of a "work".** Every ASIN is one narration in one
+marketplace. Rather than guessing which ASINs are "the same book" — the sort of
+fuzzy matching this upstream exists to avoid — each ASIN is served as a work
+containing exactly one edition. Editions are therefore never merged, and a
+title with several narrations appears several times.
+
+**The Postgres volume is not disposable.** Clients parse every ID as a signed
+32-bit integer, so ASINs can't be passed through directly and are assigned
+surrogate IDs from a sequence, stored in the `asin_id` table. Those IDs are
+what your client persists. Losing that table reassigns them and orphans every
+author and book in your library, so back it up alongside your client's
+database.
+
+Two limitations follow from Audible itself, not from this implementation:
+
+* An author's bibliography only covers what Audible actually sells, so print-
+  only backlist titles are invisible.
+* Series listings are searched by title and filtered by series ASIN, because
+  Audible exposes no way to list a series directly (`/catalog/series/{asin}`
+  doesn't exist and the catalog's `series_asin` parameter is ignored). Entries
+  that search ranks poorly can be missed.
+
+[audnexus]: https://github.com/laxamentumtech/audnexus
 
 ### Resource Requirements
 

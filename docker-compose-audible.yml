@@ -1,0 +1,49 @@
+# Docker Compose for rreading-glasses using Audible
+#
+# Book and author detail come from audnexus (the same source Audiobookshelf
+# uses), and search comes from Audible's catalog API. Neither needs
+# credentials, so there's no auth token to configure.
+#
+# The Postgres volume holds the ASIN -> ID mapping as well as the cache. It is
+# NOT disposable: deleting it reassigns every ID and orphans the library in
+# your client. Back it up alongside your client's database.
+
+services:
+  rreading-glasses:
+    depends_on:
+      rreading-glasses-db:
+        condition: service_started
+    image: ghcr.io/austinpsycho/rreading-glasses:audible
+    pull_policy: always
+    container_name: rreading-glasses
+    hostname: rreading-glasses
+    entrypoint: ["/main", "serve"]
+    command:
+      - --verbose
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      AUDIBLE_REGION: us  # Marketplace to serve: us, uk, de, fr, ca, au, jp, it, in, es, br
+      POSTGRES_HOST: rreading-glasses-db
+      POSTGRES_DATABASE: rreading-glasses
+      POSTGRES_USER: rreading-glasses
+      POSTGRES_PASSWORD:  # Generate a random string without special symbols
+    ports:
+      - "8788:8788"
+
+  rreading-glasses-db:
+    image: postgres:17
+    container_name: rreading-glasses-db
+    hostname: rreading-glasses-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rreading-glasses
+      POSTGRES_PASSWORD:  # Generated password from above
+      POSTGRES_DB: rreading-glasses
+    ports:
+      - "5432:5432"
+    volumes:
+      - rreading_glasses_data:/var/lib/postgresql/data
+
+volumes:
+  rreading_glasses_data:

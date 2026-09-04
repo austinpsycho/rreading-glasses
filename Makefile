@@ -12,6 +12,10 @@ generate: go.mod $(wildcard *.go) $(wildcard */*.go)
 build-hc: generate go.mod $(wildcard *.go) $(wildcard */*.go)
 	go build -o $(PROJECT_ROOT)/bin/rghc ./cmd/rghc/...
 
+.PHONY: build-ab
+build-ab: generate go.mod $(wildcard *.go) $(wildcard */*.go)
+	go build -o $(PROJECT_ROOT)/bin/rgab ./cmd/rgab/...
+
 .PHONY: build-gr
 build-gr: generate go.mod $(wildcard *.go) $(wildcard */*.go)
 	go build -o $(PROJECT_ROOT)/bin/rggr ./cmd/rggr/...
@@ -24,8 +28,12 @@ serve-gr:
 serve-gc:
 	go run ./cmd/rghc/main.go serve --verbose --port 8080 --hardcover-auth "Bearer $(HARDCOVER_API_KEY)"
 
+.PHONY: serve-ab
+serve-ab:
+	go run ./cmd/rgab/main.go serve --verbose --port 8080
+
 .PHONY: build
-build: build-hc build-gr
+build: build-hc build-gr build-ab
 
 .PHONY: lint
 lint:
@@ -45,6 +53,16 @@ release-hc:
 		--push \
 		.
 
+.PHONY: release-ab
+release-ab:
+	docker build -f Dockerfile \
+		--builder multiarch \
+		--platform linux/amd64,linux/arm64 \
+		--tag ghcr.io/austinpsycho/rreading-glasses:audible \
+		--build-arg RGPATH=./cmd/rgab \
+		--push \
+		.
+
 .PHONY: release-gr
 release-gr:
 	docker build -f Dockerfile \
@@ -56,4 +74,4 @@ release-gr:
 		.
 
 .PHONY: release
-release: release-hc release-gr
+release: release-hc release-gr release-ab
