@@ -39,6 +39,13 @@ type ABGetter struct {
 	// is arbitrary.
 	ratingMu sync.RWMutex
 	ratings  map[string]*audibleRating
+
+	// products caches catalog entries seen while walking an author, so those
+	// books can be mapped without an audnexus request each. Only the author
+	// walk populates this: search returns few results and they're the most
+	// visible thing in the UI, so those keep full detail.
+	productMu sync.RWMutex
+	products  map[string]*audibleProduct
 }
 
 var (
@@ -49,11 +56,12 @@ var (
 // NewAudibleGetter returns a new getter backed by Audible.
 func NewAudibleGetter(cache cache[[]byte], client *AudibleClient, ids *IDMapper) (*ABGetter, error) {
 	return &ABGetter{
-		cache:   cache,
-		client:  client,
-		ids:     ids,
-		authors: map[string]*audnexusAuthor{},
-		ratings: map[string]*audibleRating{},
+		cache:    cache,
+		client:   client,
+		ids:      ids,
+		authors:  map[string]*audnexusAuthor{},
+		ratings:  map[string]*audibleRating{},
+		products: map[string]*audibleProduct{},
 	}, nil
 }
 
@@ -210,8 +218,18 @@ func (g *ABGetter) GetBook(ctx context.Context, bookID int64, saveEditions editi
 	return out, workRsc.ForeignID, workRsc.Authors[0].ForeignID, nil
 }
 
-// workResource fetches an ASIN and maps it into the client's schema.
+// workResource maps an ASIN into the client's schema, preferring a catalog
+// entry from an author walk over a fresh audnexus lookup.
+//
+// Refreshing one author otherwise costs a request per book -- hundreds for a
+// prolific one, and the controller refreshes thirty authors at once -- which
+// saturates the upstream budget and starves interactive requests. The listing
+// that found those books already described them.
 func (g *ABGetter) workResource(ctx context.Context, asin string) (workResource, error) {
+	if p := g.product(asin); p != nil {
+		return g.mapBook(ctx, p.asBook())
+	}
+
 	book, err := g.client.GetBook(ctx, asin)
 	if err != nil {
 		return workResource{}, fmt.Errorf("getting book %s: %w", asin, err)
@@ -231,6 +249,26 @@ func (g *ABGetter) rememberRatings(products []audibleProduct) {
 			g.ratings[p.ASIN] = p.Rating
 		}
 	}
+}
+
+// rememberProducts records catalog entries so an author's books can be mapped
+// without a per-book request.
+func (g *ABGetter) rememberProducts(products []audibleProduct) {
+	g.productMu.Lock()
+	defer g.productMu.Unlock()
+
+	for _, p := range products {
+		if p.ASIN != "" {
+			g.products[p.ASIN] = &p
+		}
+	}
+}
+
+// product returns a cached catalog entry for an ASIN, if one was seen.
+func (g *ABGetter) product(asin string) *audibleProduct {
+	g.productMu.RLock()
+	defer g.productMu.RUnlock()
+	return g.products[asin]
 }
 
 // rating returns cached rating detail for an ASIN, if it's been seen.
@@ -522,6 +560,7 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 				return
 			}
 			g.rememberRatings(products)
+			g.rememberProducts(products)
 
 			for _, p := range products {
 				if p.ASIN == "" || seen[p.ASIN] || !p.hasAuthor(asin) {

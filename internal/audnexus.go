@@ -354,6 +354,44 @@ const audiblePageSize = 50
 // productResponseGroups is the minimum set of fields we need mapped.
 const productResponseGroups = "contributors,media,product_desc,product_attrs,series,rating"
 
+// asBook converts a catalog product into the same shape audnexus returns, so
+// one mapping path serves both.
+//
+// A catalog listing already carries almost everything a work needs, which
+// makes walking an author's bibliography nearly free -- otherwise every book
+// in it costs its own audnexus request. What's lost is the full description
+// (only a truncated merchandising summary is present), genres, and the ISBN.
+// Of those only the ISBN is scored during identification, and audiobooks are
+// matched on ASIN, which is present.
+func (p audibleProduct) asBook() *audnexusBook {
+	book := &audnexusBook{
+		ASIN:             p.ASIN,
+		Title:            p.Title,
+		Subtitle:         p.Subtitle,
+		Authors:          p.Authors,
+		Narrators:        p.Narrators,
+		Description:      p.MerchandisingSummary,
+		Language:         p.Language,
+		PublisherName:    p.PublisherName,
+		ReleaseDate:      p.ReleaseDate,
+		RuntimeLengthMin: p.RuntimeLengthMin,
+		Image:            p.imageURL(),
+	}
+
+	if len(p.Series) > 0 {
+		book.SeriesPrimary = &audnexusSeriesRef{
+			ASIN: p.Series[0].ASIN, Name: p.Series[0].Title, Position: p.Series[0].Sequence,
+		}
+	}
+	if len(p.Series) > 1 {
+		book.SeriesSecondary = &audnexusSeriesRef{
+			ASIN: p.Series[1].ASIN, Name: p.Series[1].Title, Position: p.Series[1].Sequence,
+		}
+	}
+
+	return book
+}
+
 // imageURL picks the largest cover Audible offers for a product.
 func (p audibleProduct) imageURL() string {
 	best, bestSize := "", -1

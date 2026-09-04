@@ -400,3 +400,78 @@ func TestRetryAfterPropagated(t *testing.T) {
 		assert.Empty(t, w.Header().Get("Retry-After"))
 	})
 }
+
+// TestProductAsBook covers mapping an author-walk book from the catalog
+// listing instead of a per-book audnexus request. Everything identification
+// scores on -- author, title, series, year, ASIN -- has to survive; only the
+// ISBN and the full description are knowingly given up.
+func TestProductAsBook(t *testing.T) {
+	t.Parallel()
+
+	p := audibleProduct{
+		ASIN:                 "B002V0QCYU",
+		Title:                "The Final Empire",
+		Subtitle:             "Mistborn Book 1",
+		Authors:              []audnexusPerson{{ASIN: "B001IGFHW6", Name: "Brandon Sanderson"}},
+		Narrators:            []audnexusPerson{{Name: "Michael Kramer"}},
+		MerchandisingSummary: "For a thousand years the ash fell.",
+		PublisherName:        "Macmillan Audio",
+		ReleaseDate:          "2008-12-28",
+		Language:             "english",
+		RuntimeLengthMin:     1479,
+		ProductImages:        map[string]string{"500": "https://example.invalid/500.jpg"},
+		Series: []audibleSeries{
+			{ASIN: "B006K1P698", Title: "The Mistborn Saga", Sequence: "1"},
+			{ASIN: "B0DMXTJ8WH", Title: "The Cosmere", Sequence: ""},
+		},
+	}
+
+	book := p.asBook()
+
+	assert.Equal(t, "B002V0QCYU", book.ASIN)
+	assert.Equal(t, "The Final Empire", book.Title)
+	assert.Equal(t, "Mistborn Book 1", book.Subtitle)
+	assert.Equal(t, "2008-12-28", book.ReleaseDate)
+	assert.Equal(t, "https://example.invalid/500.jpg", book.Image)
+
+	require.Len(t, book.Authors, 1)
+	assert.Equal(t, "B001IGFHW6", book.Authors[0].ASIN)
+	require.Len(t, book.Narrators, 1)
+
+	require.NotNil(t, book.SeriesPrimary)
+	assert.Equal(t, "The Mistborn Saga", book.SeriesPrimary.Name)
+	assert.Equal(t, "1", book.SeriesPrimary.Position)
+	require.NotNil(t, book.SeriesSecondary)
+	assert.Equal(t, "The Cosmere", book.SeriesSecondary.Name)
+
+	// Knowingly absent -- catalog listings carry neither.
+	assert.Empty(t, book.ISBN)
+	assert.Empty(t, book.Genres)
+}
+
+// TestWorkResourcePrefersProduct checks that a cached catalog entry is used
+// instead of an audnexus request. The test client points at a host that
+// doesn't resolve, so a lookup would fail rather than silently pass.
+func TestWorkResourcePrefersProduct(t *testing.T) {
+	ids, ctx := newTestMapper(t)
+
+	cache, err := NewCache(ctx, testDSN, nil, nil)
+	require.NoError(t, err)
+
+	g, err := NewAudibleGetter(cache, NewAudibleClient("invalid.invalid", "invalid.invalid", "us", 0), ids)
+	require.NoError(t, err)
+
+	asin := testASIN(t)
+	g.authors["B001IGFHW6"] = &audnexusAuthor{ASIN: "B001IGFHW6", Name: "Brandon Sanderson"}
+	g.rememberProducts([]audibleProduct{{
+		ASIN:    asin,
+		Title:   "The Final Empire",
+		Authors: []audnexusPerson{{ASIN: "B001IGFHW6", Name: "Brandon Sanderson"}},
+	}})
+
+	work, err := g.workResource(ctx, asin)
+	require.NoError(t, err)
+	assert.Equal(t, "The Final Empire", work.Title)
+	require.Len(t, work.Books, 1)
+	assert.Equal(t, asin, work.Books[0].Asin)
+}
