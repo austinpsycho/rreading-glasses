@@ -1,0 +1,321 @@
+package internal
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func newTestAudibleGetter(t *testing.T) *ABGetter {
+	t.Helper()
+
+	ids, ctx := newTestMapper(t)
+
+	cache, err := NewCache(ctx, testDSN, nil, nil)
+	require.NoError(t, err)
+
+	g, err := NewAudibleGetter(cache, NewAudibleClient("api.audnex.us", "api.audible.com", "us"), ids)
+	require.NoError(t, err)
+
+	return g
+}
+
+// testBook mirrors a real audnexus response, trimmed to the fields we map.
+func testBook(asin string) *audnexusBook {
+	return &audnexusBook{
+		ASIN:     asin,
+		Title:    "The Final Empire",
+		Subtitle: "Mistborn Book 1",
+		Authors: []audnexusPerson{
+			{ASIN: "B001IGFHW6", Name: "Brandon Sanderson"},
+		},
+		Narrators:        []audnexusPerson{{Name: "Michael Kramer"}},
+		Description:      "For a thousand years the ash fell.",
+		Genres:           []audnexusGenre{{Name: "Science Fiction & Fantasy", Type: "genre"}},
+		Image:            "https://m.media-amazon.com/images/I/917NNRCArfL.jpg",
+		ISBN:             "9781427206374",
+		Language:         "english",
+		PublisherName:    "Macmillan Audio",
+		Rating:           "4.8",
+		Region:           "us",
+		ReleaseDate:      "2008-12-28T00:00:00.000Z",
+		RuntimeLengthMin: 1479,
+		SeriesPrimary:    &audnexusSeriesRef{ASIN: "B006K1P698", Name: "The Mistborn Saga", Position: "1"},
+	}
+}
+
+// TestAudibleBookDataIntegrity mirrors TestGetBookDataIntegrity for the
+// Audible upstream. The client is particularly sensitive to null values. For a
+// given work resource it MUST
+//   - have non-null top-level books
+//   - non-null ratingcount, averagerating
+//   - have a contributor with a foreign id
+func TestAudibleBookDataIntegrity(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	work, err := g.mapBook(ctx, testBook(testASIN(t)))
+	require.NoError(t, err)
+
+	require.Len(t, work.Books, 1)
+	require.Len(t, work.Authors, 1)
+	require.Len(t, work.Authors[0].Works, 1)
+
+	book := work.Books[0]
+	require.Len(t, book.Contributors, 1)
+	assert.NotZero(t, book.Contributors[0].ForeignID)
+	assert.Equal(t, "Author", book.Contributors[0].Role)
+	assert.Equal(t, work.Authors[0].ForeignID, book.Contributors[0].ForeignID)
+
+	assert.NotZero(t, work.ForeignID)
+	assert.NotZero(t, book.ForeignID)
+	assert.Equal(t, book.ForeignID, work.BestBookID)
+
+	// Work and edition describe the same product but must not share an ID.
+	assert.NotEqual(t, work.ForeignID, book.ForeignID)
+
+	// Serialized output must not contain nulls in the collections the client
+	// walks unconditionally.
+	out, err := json.Marshal(work)
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+
+	for _, field := range []string{"Books", "Authors", "Series", "Genres", "RelatedWorks"} {
+		assert.NotNil(t, raw[field], "%s must not be null", field)
+	}
+}
+
+func TestAudibleBookMapping(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	work, err := g.mapBook(ctx, testBook(testASIN(t)))
+	require.NoError(t, err)
+
+	book := work.Books[0]
+
+	t.Run("splits title and subtitle", func(t *testing.T) {
+		assert.Equal(t, "The Final Empire", work.Title)
+		assert.Equal(t, "The Final Empire", work.ShortTitle)
+		assert.Equal(t, "The Final Empire: Mistborn Book 1", work.FullTitle)
+	})
+
+	t.Run("marks the edition as audio", func(t *testing.T) {
+		assert.False(t, book.IsEbook)
+		assert.Equal(t, "Audiobook", book.Format)
+	})
+
+	t.Run("carries identifiers through", func(t *testing.T) {
+		// The ASIN is what makes matching against existing audio files work,
+		// so it has to survive the mapping.
+		assert.NotEmpty(t, book.Asin)
+		assert.Equal(t, "9781427206374", book.Isbn13)
+	})
+
+	t.Run("surfaces the narrator", func(t *testing.T) {
+		// There's no narrator field in the schema, so it rides on edition info.
+		assert.Equal(t, "Narrated by Michael Kramer", book.EditionInformation)
+	})
+
+	t.Run("normalizes release date", func(t *testing.T) {
+		assert.Equal(t, "2008-12-28", book.ReleaseDate)
+		assert.Equal(t, "2008-12-28T00:00:00.000Z", book.ReleaseDateRaw)
+		assert.Equal(t, "2008-12-28", work.ReleaseDate)
+	})
+
+	t.Run("normalizes language", func(t *testing.T) {
+		assert.Equal(t, "eng", book.Language)
+	})
+
+	t.Run("parses the rating", func(t *testing.T) {
+		assert.InDelta(t, 4.8, book.AverageRating, 0.001)
+	})
+}
+
+func TestAudibleBookWithoutAuthor(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	// Audible occasionally credits contributors with no ASIN. The client can't
+	// do anything with an authorless work, so this must fail rather than
+	// produce one.
+	book := testBook(testASIN(t))
+	book.Authors = []audnexusPerson{{Name: "Nobody"}}
+
+	_, err := g.mapBook(ctx, book)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errNotFound)
+}
+
+func TestAudibleBookMissingFields(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	book := testBook(testASIN(t))
+	book.Description = ""
+	book.Summary = ""
+	book.Genres = nil
+	book.Subtitle = ""
+	book.SeriesPrimary = nil
+	book.Narrators = nil
+	book.Rating = ""
+	book.ReleaseDate = ""
+
+	work, err := g.mapBook(ctx, book)
+	require.NoError(t, err)
+
+	// Description and genres must be set to something; the client rejects
+	// empty values here.
+	assert.Equal(t, "N/A", work.Books[0].Description)
+	assert.Equal(t, []string{"none"}, work.Genres)
+
+	assert.Equal(t, work.Title, work.FullTitle)
+	assert.Empty(t, work.Series)
+	assert.Empty(t, work.Books[0].EditionInformation)
+	assert.Zero(t, work.Books[0].AverageRating)
+	assert.Empty(t, work.Books[0].ReleaseDate)
+}
+
+func TestAudibleSeriesMapping(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	book := testBook(testASIN(t))
+	book.SeriesSecondary = &audnexusSeriesRef{ASIN: "B0DMXTJ8WH", Name: "The Cosmere", Position: ""}
+
+	work, err := g.mapBook(ctx, book)
+	require.NoError(t, err)
+
+	require.Len(t, work.Series, 2)
+
+	primary := work.Series[0]
+	assert.Equal(t, "The Mistborn Saga", primary.Title)
+	assert.NotZero(t, primary.ForeignID)
+	require.Len(t, primary.LinkItems, 1)
+	assert.Equal(t, 1, primary.LinkItems[0].SeriesPosition)
+	assert.Equal(t, "1", primary.LinkItems[0].PositionInSeries)
+	assert.Equal(t, work.ForeignID, primary.LinkItems[0].ForeignWorkID)
+	assert.True(t, primary.LinkItems[0].Primary)
+
+	secondary := work.Series[1]
+	assert.Equal(t, "The Cosmere", secondary.Title)
+	assert.NotEqual(t, primary.ForeignID, secondary.ForeignID)
+	assert.False(t, secondary.LinkItems[0].Primary)
+	// An unnumbered entry shouldn't be forced to position 0 in the raw field.
+	assert.Empty(t, secondary.LinkItems[0].PositionInSeries)
+}
+
+// TestAudibleSeriesTitleRecorded covers the reason labels exist: Audible has
+// no endpoint to resolve a series ASIN back to a name, so GetSeries can only
+// work if the title was recorded when the book was first mapped.
+func TestAudibleSeriesTitleRecorded(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	book := testBook(testASIN(t))
+	book.SeriesPrimary.ASIN = testASIN(t)
+
+	work, err := g.mapBook(ctx, book)
+	require.NoError(t, err)
+	require.Len(t, work.Series, 1)
+
+	ref, err := g.ids.Ref(ctx, work.Series[0].ForeignID)
+	require.NoError(t, err)
+	assert.Equal(t, kindSeries, ref.kind)
+	assert.Equal(t, "The Mistborn Saga", ref.label)
+}
+
+func TestAudibleReleaseDate(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name    string
+		in      string
+		want    string
+		wantRaw string
+	}{
+		{"audnexus timestamp", "2008-12-28T00:00:00.000Z", "2008-12-28", "2008-12-28T00:00:00.000Z"},
+		{"rfc3339", "2008-12-28T08:01:00Z", "2008-12-28", "2008-12-28T08:01:00Z"},
+		{"date only", "2008-12-28", "2008-12-28", "2008-12-28"},
+		{"empty", "", "", ""},
+		{"unparseable", "sometime", "", "sometime"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, raw := audibleReleaseDate(tt.in)
+			assert.Equal(t, tt.want, got)
+			assert.Equal(t, tt.wantRaw, raw)
+		})
+	}
+}
+
+func TestNormalizeLanguage(t *testing.T) {
+	t.Parallel()
+
+	for in, want := range map[string]string{
+		"english":  "eng",
+		"English":  "eng",
+		" german ": "ger",
+		"japanese": "jpn",
+		"":         "",
+		"klingon":  "klingon", // Unknown values pass through rather than vanish.
+	} {
+		assert.Equal(t, want, normalizeLanguage(in), "input %q", in)
+	}
+}
+
+func TestAudibleProductHelpers(t *testing.T) {
+	t.Parallel()
+
+	p := audibleProduct{
+		Authors: []audnexusPerson{{ASIN: "B001IGFHW6", Name: "Brandon Sanderson"}},
+		ProductImages: map[string]string{
+			"500":  "https://example.invalid/500.jpg",
+			"1024": "https://example.invalid/1024.jpg",
+			"bad":  "https://example.invalid/bad.jpg",
+		},
+	}
+
+	t.Run("picks the largest cover", func(t *testing.T) {
+		assert.Equal(t, "https://example.invalid/1024.jpg", p.imageURL())
+	})
+
+	t.Run("matches authors by ASIN", func(t *testing.T) {
+		// Audible only filters the catalog by name, so this is what keeps two
+		// authors sharing a name out of each other's bibliographies.
+		assert.True(t, p.hasAuthor("B001IGFHW6"))
+		assert.True(t, p.hasAuthor("b001igfhw6"))
+		assert.False(t, p.hasAuthor("B0719B6Z8Y"))
+	})
+
+	t.Run("handles missing images", func(t *testing.T) {
+		assert.Empty(t, audibleProduct{}.imageURL())
+	})
+}
+
+func TestAuthorASIN(t *testing.T) {
+	t.Parallel()
+
+	assert.Empty(t, authorASIN(nil))
+	assert.Empty(t, authorASIN([]audnexusPerson{{Name: "No ASIN"}}))
+
+	// Co-authors are common and the first credited ASIN wins.
+	assert.Equal(t, "B002", authorASIN([]audnexusPerson{
+		{Name: "Contributor"},
+		{ASIN: "B002", Name: "Author"},
+		{ASIN: "B003", Name: "Co-author"},
+	}))
+}
+
+func TestPersonNames(t *testing.T) {
+	t.Parallel()
+
+	assert.Empty(t, personNames(nil))
+	assert.Equal(t, []string{"A", "B"}, personNames([]audnexusPerson{
+		{Name: "A"}, {Name: ""}, {Name: "B"},
+	}))
+}
