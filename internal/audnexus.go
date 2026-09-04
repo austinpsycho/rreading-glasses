@@ -85,7 +85,19 @@ type audibleProduct struct {
 	Language             string            `json:"language"`
 	RuntimeLengthMin     int64             `json:"runtime_length_min"`
 	Series               []audibleSeries   `json:"series"`
+	Rating               *audibleRating    `json:"rating"`
 	ProductImages        map[string]string `json:"product_images"`
+}
+
+// audibleRating is Audible's rating detail. audnexus exposes an average but no
+// count, and the client sorts search results by rating count, so this is the
+// only source for that ordering.
+type audibleRating struct {
+	NumReviews          int64 `json:"num_reviews"`
+	OverallDistribution struct {
+		AverageRating float64 `json:"average_rating"`
+		NumRatings    int64   `json:"num_ratings"`
+	} `json:"overall_distribution"`
 }
 
 type audibleSeries struct {
@@ -244,7 +256,7 @@ func (c *AudibleClient) ProductsByAuthor(ctx context.Context, name string, page 
 const audiblePageSize = 50
 
 // productResponseGroups is the minimum set of fields we need mapped.
-const productResponseGroups = "contributors,media,product_desc,product_attrs,series"
+const productResponseGroups = "contributors,media,product_desc,product_attrs,series,rating"
 
 // imageURL picks the largest cover Audible offers for a product.
 func (p audibleProduct) imageURL() string {

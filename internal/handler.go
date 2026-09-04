@@ -216,13 +216,19 @@ func (h *Handler) bulkBook(w http.ResponseWriter, r *http.Request) {
 		Authors: []AuthorResource{},
 	}
 
-	mu := sync.Mutex{}
+	// Results are collected by position rather than completion order. The
+	// works are sorted by rating count below, and that sort isn't stable, so
+	// appending in whatever order the goroutines finish makes the response
+	// order arbitrary whenever counts tie -- which reshuffles search results
+	// on every request.
+	ordered := make([]*workResource, len(ids))
+
 	wg := sync.WaitGroup{}
 
-	for _, id := range ids {
+	for i, id := range ids {
 		wg.Add(1)
 
-		go func(foreignBookID int64) {
+		go func(idx int, foreignBookID int64) {
 			defer wg.Done()
 
 			b, _, err := h.ctrl.GetBook(ctx, foreignBookID)
@@ -246,24 +252,31 @@ func (h *Handler) bulkBook(w http.ResponseWriter, r *http.Request) {
 				workRsc.Books[0].Title = workRsc.Books[0].FullTitle
 			}
 
-			mu.Lock()
-			defer mu.Unlock()
-
-			result.Works = append(result.Works, workRsc)
-			result.Series = []SeriesResource{}
-
-			// Check if our result already includes this author.
-			for _, a := range result.Authors {
-				if a.ForeignID == workRsc.Authors[0].ForeignID {
-					return // Nothing more to do.
-				}
-			}
-
-			result.Authors = append(result.Authors, workRsc.Authors...)
-		}(id)
+			ordered[idx] = &workRsc
+		}(i, id)
 	}
 
 	wg.Wait()
+
+	seenAuthors := map[int64]bool{}
+
+	for _, workRsc := range ordered {
+		if workRsc == nil {
+			continue // Failed to load; already logged.
+		}
+
+		result.Works = append(result.Works, *workRsc)
+
+		if len(workRsc.Authors) == 0 {
+			continue
+		}
+		if seenAuthors[workRsc.Authors[0].ForeignID] {
+			continue
+		}
+		seenAuthors[workRsc.Authors[0].ForeignID] = true
+
+		result.Authors = append(result.Authors, workRsc.Authors...)
+	}
 
 	// Collect and de-dupe series -- is this even needed?
 	seenSeries := map[int64]bool{}

@@ -32,6 +32,13 @@ type ABGetter struct {
 	// number of distinct authors in a library, which is small.
 	authorMu sync.RWMutex
 	authors  map[string]*audnexusAuthor
+
+	// ratings caches rating counts seen in catalog responses. audnexus omits
+	// them, and the client sorts search results by rating count -- with every
+	// count equal the sort is comparing a constant and the order it produces
+	// is arbitrary.
+	ratingMu sync.RWMutex
+	ratings  map[string]*audibleRating
 }
 
 var (
@@ -46,6 +53,7 @@ func NewAudibleGetter(cache cache[[]byte], client *AudibleClient, ids *IDMapper)
 		client:  client,
 		ids:     ids,
 		authors: map[string]*audnexusAuthor{},
+		ratings: map[string]*audibleRating{},
 	}, nil
 }
 
@@ -83,6 +91,7 @@ func (g *ABGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 	if err != nil {
 		return nil, fmt.Errorf("searching: %w", err)
 	}
+	g.rememberRatings(products)
 
 	results := []SearchResource{}
 	for _, p := range products {
@@ -210,6 +219,27 @@ func (g *ABGetter) workResource(ctx context.Context, asin string) (workResource,
 	return g.mapBook(ctx, book)
 }
 
+// rememberRatings records rating detail from a catalog response. Ratings ride
+// along on searches and author listings we already make, so no extra request
+// is needed for the books a user actually sees.
+func (g *ABGetter) rememberRatings(products []audibleProduct) {
+	g.ratingMu.Lock()
+	defer g.ratingMu.Unlock()
+
+	for _, p := range products {
+		if p.ASIN != "" && p.Rating != nil {
+			g.ratings[p.ASIN] = p.Rating
+		}
+	}
+}
+
+// rating returns cached rating detail for an ASIN, if it's been seen.
+func (g *ABGetter) rating(asin string) *audibleRating {
+	g.ratingMu.RLock()
+	defer g.ratingMu.RUnlock()
+	return g.ratings[asin]
+}
+
 // authorDetail returns an author's name, image and bio, fetching each ASIN at
 // most once. A failed lookup is cached as nil so a book by an author audnexus
 // doesn't know about doesn't retry on every subsequent mapping.
@@ -282,7 +312,18 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 	}
 
 	released, releasedRaw := audibleReleaseDate(book.ReleaseDate)
+
+	// audnexus gives a display average and nothing else. Audible's catalog has
+	// the counts, which the client needs to order search results.
 	rating, _ := strconv.ParseFloat(book.Rating, 64)
+	ratingCount := int64(0)
+	if r := g.rating(book.ASIN); r != nil {
+		ratingCount = r.OverallDistribution.NumRatings
+		if r.OverallDistribution.AverageRating > 0 {
+			rating = r.OverallDistribution.AverageRating
+		}
+	}
+	ratingSum := int64(float64(ratingCount) * rating)
 
 	editionInfo := ""
 	if narrators := personNames(book.Narrators); len(narrators) > 0 {
@@ -307,8 +348,8 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 		ImageURL:           book.Image,
 		IsEbook:            false, // Audible is audio-only by definition.
 		NumPages:           0,     // Audible reports runtime, not pages.
-		RatingCount:        0,     // audnexus exposes an average but no count.
-		RatingSum:          0,
+		RatingCount:        ratingCount,
+		RatingSum:          ratingSum,
 		AverageRating:      rating,
 		URL:                audibleURL(book.ASIN),
 		ReleaseDate:        released,
@@ -349,6 +390,8 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 		RelatedWorks:   []int{},
 		Series:         series,
 		BestBookID:     bookID,
+		RatingCount:    ratingCount,
+		RatingSum:      ratingSum,
 		AverageRating:  rating,
 	}
 
@@ -410,6 +453,7 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 	if err != nil {
 		return nil, fmt.Errorf("getting author products: %w", err)
 	}
+	g.rememberRatings(products)
 
 	description := author.Description
 	if description == "" {
@@ -477,6 +521,7 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 			if len(products) == 0 {
 				return
 			}
+			g.rememberRatings(products)
 
 			for _, p := range products {
 				if p.ASIN == "" || seen[p.ASIN] || !p.hasAuthor(asin) {
