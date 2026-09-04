@@ -33,6 +33,7 @@ type server struct {
 	AudnexusHost string `default:"api.audnex.us" env:"AUDNEXUS_HOST" help:"audnexus host, used for book and author detail."`
 	AudibleHost  string `default:"api.audible.com" env:"AUDIBLE_HOST" help:"Audible catalog host, used for search."`
 	Region       string `default:"us" env:"AUDIBLE_REGION" help:"Audible marketplace to serve, e.g. us, uk, de."`
+	Rate         int    `default:"10" env:"AUDIBLE_RATE" help:"Max requests per second to each upstream. Raise to import a large library faster; lower if audnexus returns 429s."`
 }
 
 func (s *server) Run() error {
@@ -57,7 +58,7 @@ func (s *server) Run() error {
 		return fmt.Errorf("setting up ID mapper: %w", err)
 	}
 
-	client := internal.NewAudibleClient(s.AudnexusHost, s.AudibleHost, s.Region)
+	client := internal.NewAudibleClient(s.AudnexusHost, s.AudibleHost, s.Region, s.Rate)
 
 	getter, err := internal.NewAudibleGetter(cache, client, ids)
 	if err != nil {

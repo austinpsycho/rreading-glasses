@@ -128,28 +128,42 @@ type AudibleClient struct {
 	region       string
 }
 
-// NewAudibleClient returns a client for the given hosts and region.
-func NewAudibleClient(audnexusHost, audibleHost, region string) *AudibleClient {
+// NewAudibleClient returns a client for the given hosts and region. rate is the
+// per-upstream request ceiling in requests per second; zero uses the default.
+func NewAudibleClient(audnexusHost, audibleHost, region string, rate int) *AudibleClient {
 	if region == "" {
 		region = defaultRegion
 	}
+	if rate <= 0 {
+		rate = defaultRate
+	}
 	return &AudibleClient{
-		audnexus:     newThrottledClient(),
-		audible:      newThrottledClient(),
+		audnexus:     newThrottledClient(rate),
+		audible:      newThrottledClient(rate),
 		audnexusHost: audnexusHost,
 		audibleHost:  audibleHost,
 		region:       region,
 	}
 }
 
+// defaultRate is the per-upstream requests-per-second ceiling.
+//
+// The controller runs up to 30 author refreshes and 25 work refreshes at once,
+// and unlike the Hardcover upstream -- which batches 25 GraphQL queries into a
+// single request -- every book here costs its own HTTP call. At the 3/s the
+// other upstreams use, an interactive request queues behind the whole
+// background backlog and takes ten seconds or more to come back.
+const defaultRate = 10
+
 // newThrottledClient rate limits an unauthenticated upstream. Neither API
-// documents a limit, and both will start refusing traffic if pushed, so this
-// is deliberately conservative.
-func newThrottledClient() *http.Client {
+// documents a limit and both will start refusing traffic if pushed, so this is
+// tunable: raise it to import a large library faster, lower it if audnexus --
+// a free community service -- starts returning 429s.
+func newThrottledClient(rate int) *http.Client {
 	return &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: throttledTransport{
-			ticker:       time.NewTicker(time.Second / 3),
+			ticker:       time.NewTicker(time.Second / time.Duration(rate)),
 			RoundTripper: errorProxyTransport{http.DefaultTransport},
 		},
 	}

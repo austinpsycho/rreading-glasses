@@ -16,7 +16,7 @@ func newTestAudibleGetter(t *testing.T) *ABGetter {
 	cache, err := NewCache(ctx, testDSN, nil, nil)
 	require.NoError(t, err)
 
-	g, err := NewAudibleGetter(cache, NewAudibleClient("api.audnex.us", "api.audible.com", "us"), ids)
+	g, err := NewAudibleGetter(cache, NewAudibleClient("api.audnex.us", "api.audible.com", "us", 0), ids)
 	require.NoError(t, err)
 
 	// Seed author detail so mapping doesn't reach the network. A nil entry is
