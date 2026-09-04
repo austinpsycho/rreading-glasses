@@ -2,7 +2,11 @@ package internal
 
 import (
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -362,4 +366,37 @@ func TestPersonNames(t *testing.T) {
 	assert.Equal(t, []string{"A", "B"}, personNames([]audnexusPerson{
 		{Name: "A"}, {Name: ""}, {Name: "B"},
 	}))
+}
+
+// TestRetryAfterPropagated covers the header the client needs to back off
+// sensibly. Without it the client retries a 429 every five seconds in an
+// unbounded loop, which keeps the upstream rate limited and stalls an import
+// on a single book.
+func TestRetryAfterPropagated(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{}
+
+	t.Run("sets the header for a retryable error", func(t *testing.T) {
+		t.Parallel()
+
+		w := httptest.NewRecorder()
+		h.error(w, retryableErr{
+			after: 90 * time.Second,
+			err:   errors.Join(statusErr(http.StatusTooManyRequests), errors.New("rate limited")),
+		})
+
+		assert.Equal(t, http.StatusTooManyRequests, w.Code)
+		assert.Equal(t, "90", w.Header().Get("Retry-After"))
+	})
+
+	t.Run("leaves it off for other errors", func(t *testing.T) {
+		t.Parallel()
+
+		w := httptest.NewRecorder()
+		h.error(w, errNotFound)
+
+		assert.Equal(t, http.StatusNotFound, w.Code)
+		assert.Empty(t, w.Header().Get("Retry-After"))
+	})
 }

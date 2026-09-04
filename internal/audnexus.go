@@ -178,6 +178,12 @@ func newThrottledClient(rate int) *http.Client {
 // library import means silently missing entries rather than a slow one.
 const maxRetries = 4
 
+// exhaustedBackoff is the minimum wait reported to the client once our own
+// retries are used up. audnexus's window is around a minute in practice, and
+// anything shorter just has the client poking a service that's asked it to
+// stop.
+const exhaustedBackoff = 60 * time.Second
+
 // maxBackoff caps how long a single attempt will wait. An upstream asking for
 // several minutes is better handled by failing this book and letting the
 // client retry than by pinning a goroutine.
@@ -188,14 +194,22 @@ func (c *AudibleClient) get(ctx context.Context, client *http.Client, url string
 		body, err := c.attempt(ctx, client, url, attempt)
 
 		var retry retryableErr
-		if errors.As(err, &retry) && attempt < maxRetries {
-			Log(ctx).Debug("backing off", "url", url, "wait", retry.after, "attempt", attempt)
-			select {
-			case <-time.After(retry.after):
-				continue
-			case <-ctx.Done():
-				return ctx.Err()
+		if errors.As(err, &retry) {
+			if attempt < maxRetries {
+				Log(ctx).Debug("backing off", "url", url, "wait", retry.after, "attempt", attempt)
+				select {
+				case <-time.After(retry.after):
+					continue
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
+
+			// Out of retries. Report a wait long enough to actually clear the
+			// upstream's window: the client retries 429s in an unbounded loop
+			// and defaults to five seconds, which keeps a rate-limited
+			// upstream rate limited.
+			return retryableErr{after: max(retry.after, exhaustedBackoff), err: retry.err}
 		}
 		if err != nil {
 			return err
@@ -216,6 +230,10 @@ type retryableErr struct {
 
 func (e retryableErr) Error() string { return e.err.Error() }
 func (e retryableErr) Unwrap() error { return e.err }
+
+// RetryAfter implements retryAfterErr so the handler can pass the wait on to
+// the client instead of letting it guess.
+func (e retryableErr) RetryAfter() time.Duration { return e.after }
 
 func (c *AudibleClient) attempt(ctx context.Context, client *http.Client, url string, attempt int) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

@@ -649,6 +649,18 @@ func (*Handler) error(w http.ResponseWriter, err error) {
 	if errors.As(err, &s) {
 		status = s.Status()
 	}
+
+	// The client retries a 429 in an unbounded loop and falls back to five
+	// seconds when we don't say otherwise, so an upstream cooldown turns into
+	// it hammering us -- and us hammering the upstream -- until the window
+	// happens to clear. Pass the wait along when we know it.
+	var retry retryAfterErr
+	if errors.As(err, &retry) {
+		if after := retry.RetryAfter(); after > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(int(after.Seconds())))
+		}
+	}
+
 	http.Error(w, err.Error(), status)
 }
 
