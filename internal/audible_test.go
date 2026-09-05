@@ -789,3 +789,39 @@ func TestGetBookDoesNotSaveEditions(t *testing.T) {
 
 	assert.Zero(t, called, "GetBook must not run the editions callback")
 }
+
+// TestAuthorWalkOnlyYieldsLedBooks covers the expansion that a contributor
+// credit causes. A book the author merely contributed to belongs to its
+// primary author and the client discards it from this author -- but not before
+// fetching it, minting an author for whoever leads it, and queueing that
+// author's catalog to be walked. Across Audible's anthologies that walks the
+// co-authorship graph until it has covered most of the store.
+func TestAuthorWalkOnlyYieldsLedBooks(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	led := audibleProduct{
+		ASIN:    testASIN(t),
+		Title:   "Their Own Book",
+		Authors: []audnexusPerson{{Name: "Brandon Sanderson"}},
+	}
+	contributed := audibleProduct{
+		ASIN:  testASIN(t),
+		Title: "Someone Else's Anthology",
+		Authors: []audnexusPerson{
+			{Name: "Other Lead"},
+			{Name: "Brandon Sanderson"},
+		},
+	}
+
+	key := authorKey(audnexusPerson{Name: "Brandon Sanderson"})
+
+	assert.Equal(t, key, g.authorKeyOf(led.Authors), "a led book resolves to this author")
+	assert.NotEqual(t, key, g.authorKeyOf(contributed.Authors),
+		"a contributed book resolves to whoever leads it")
+
+	// Both still credit them, which is why matching on credit over-collects.
+	assert.True(t, contributed.creditsAuthor(key, "Brandon Sanderson"))
+
+	_ = ctx
+}

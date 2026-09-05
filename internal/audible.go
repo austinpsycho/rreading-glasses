@@ -701,7 +701,9 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 	// Seed the author with the first work we can actually load. The controller
 	// backfills the rest from GetAuthorBooks.
 	for _, p := range products {
-		if !p.creditsAuthor(asin, name) {
+		// Seed with a book this author leads, for the same reason the walk
+		// only yields those.
+		if g.authorKeyOf(p.Authors) != asin {
 			continue
 		}
 
@@ -774,7 +776,14 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 			g.rememberProducts(products)
 
 			for _, p := range products {
-				if p.ASIN == "" || seen[p.ASIN] || !p.creditsAuthor(asin, name) {
+				// Only books this author leads. A book they merely contributed
+				// to belongs to its primary author, and the client discards it
+				// from this author anyway -- but not before fetching it,
+				// minting an author for whoever does lead it, and queueing
+				// that author's own catalog to be walked. With Audible's
+				// anthologies and collaborations that expands across the
+				// co-authorship graph until it has walked most of the store.
+				if p.ASIN == "" || seen[p.ASIN] || g.authorKeyOf(p.Authors) != asin {
 					continue
 				}
 				seen[p.ASIN] = true
