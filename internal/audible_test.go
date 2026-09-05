@@ -667,3 +667,36 @@ func TestAuthorKeyForPrefersKnownASIN(t *testing.T) {
 	g.rememberAlias("Nobody", "name:nobody")
 	assert.Equal(t, "name:nobody", g.authorKeyFor(audnexusPerson{Name: "Nobody"}))
 }
+
+// TestSearchAndMapAgreeOnAuthor pins the invariant that broke when search and
+// book mapping keyed authors differently: search minted a name-derived ID
+// while the work it pointed at mapped to an aliased ASIN, so GetAuthor found
+// no works for the ID the client had been given and reported the author as
+// missing.
+func TestSearchAndMapAgreeOnAuthor(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	g.authors["B0LUDWIG001"] = &audnexusAuthor{ASIN: "B0LUDWIG001", Name: "David Ludwig"}
+
+	// A credited title establishes the alias, as a catalog listing would.
+	g.rememberAliases([]audibleProduct{{
+		ASIN:    "B0TAGGED001",
+		Authors: []audnexusPerson{{ASIN: "B0LUDWIG001", Name: "David Ludwig"}},
+	}})
+
+	// An uncredited title: what search and mapping each make of it must match.
+	credits := []audnexusPerson{{Name: "David Ludwig"}}
+
+	rsc, err := g.searchResource(ctx, testASIN(t), g.authorKeyOf(credits))
+	require.NoError(t, err)
+
+	book := testBook(testASIN(t))
+	book.Authors = credits
+
+	work, err := g.mapBook(ctx, book)
+	require.NoError(t, err)
+
+	assert.Equal(t, rsc.Author.ID, work.Authors[0].ForeignID,
+		"search and mapping must mint the same author ID")
+}

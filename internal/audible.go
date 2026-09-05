@@ -98,7 +98,8 @@ func (g *ABGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 			// region may still match something by name.
 			Log(ctx).Debug("ASIN lookup missed, falling back to search", "asin", asin, "err", err)
 		} else {
-			rsc, err := g.searchResource(ctx, book.ASIN, authorASIN(book.Authors))
+			g.rememberAliases([]audibleProduct{{Authors: book.Authors}})
+			rsc, err := g.searchResource(ctx, book.ASIN, g.authorKeyOf(book.Authors))
 			if err != nil {
 				return nil, err
 			}
@@ -112,12 +113,16 @@ func (g *ABGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 	}
 	g.rememberRatings(products)
 
+	// Learn every credited ASIN before minting any IDs, so a title that omits
+	// one still keys to the same author as the titles that carry it.
+	g.rememberAliases(products)
+
 	results := []SearchResource{}
 	for _, p := range products {
 		if p.ASIN == "" || len(p.Authors) == 0 {
 			continue // Without an author the client can't do anything with it.
 		}
-		rsc, err := g.searchResource(ctx, p.ASIN, authorASIN(p.Authors))
+		rsc, err := g.searchResource(ctx, p.ASIN, g.authorKeyOf(p.Authors))
 		if err != nil {
 			Log(ctx).Warn("problem mapping search result", "asin", p.ASIN, "err", err)
 			continue
@@ -330,7 +335,7 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 	// later joins this author instead of forming a twin.
 	g.rememberAlias(primary.Name, primary.ASIN)
 
-	authASIN := g.authorKeyFor(primary)
+	authASIN := g.authorKeyOf(book.Authors)
 
 	workID, err := g.ids.ID(ctx, kindWork, book.ASIN, book.Title)
 	if err != nil {
@@ -518,6 +523,20 @@ func (g *ABGetter) rememberAliases(products []audibleProduct) {
 			g.rememberAlias(a.Name, a.ASIN)
 		}
 	}
+}
+
+// authorKeyOf returns the mapping key for a book's primary author.
+//
+// Every path that mints an author ID has to agree. Search minting a
+// name-derived key while the work it points at maps to an aliased ASIN gives
+// the client an ID that GetAuthor can find no works for, which surfaces as
+// "an author with this ID was not found".
+func (g *ABGetter) authorKeyOf(authors []audnexusPerson) string {
+	primary, ok := primaryAuthor(authors)
+	if !ok {
+		return ""
+	}
+	return g.authorKeyFor(primary)
 }
 
 // authorKeyFor returns the mapping key for a credit, preferring an ASIN we've
