@@ -619,7 +619,7 @@ func TestSearchAndMapAgreeOnAuthor(t *testing.T) {
 
 	credits := []audnexusPerson{{Name: "David Ludwig MD PhD"}}
 
-	rsc, err := g.searchResource(ctx, testASIN(t), g.authorKeyOf(credits))
+	rsc, err := g.searchResource(ctx, testASIN(t), g.authorKeyOf(credits), authorDisplayName(credits))
 	require.NoError(t, err)
 
 	book := testBook(testASIN(t))
@@ -630,4 +630,36 @@ func TestSearchAndMapAgreeOnAuthor(t *testing.T) {
 
 	assert.Equal(t, rsc.Author.ID, work.Authors[0].ForeignID)
 	assert.Equal(t, "David Ludwig", work.Authors[0].Name, "credentials are stripped for display")
+}
+
+// TestAuthorDisplayNameKeepsCasing covers the name shown in the client. Keys
+// are lower cased for identity, so without recording the name as written every
+// author reads "david ludwig".
+func TestAuthorDisplayNameKeepsCasing(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "David Ludwig", authorDisplayName([]audnexusPerson{{Name: "David Ludwig MD PhD"}}))
+	assert.Equal(t, "Brandon Sanderson",
+		authorDisplayName([]audnexusPerson{{ASIN: "B001IGFHW6", Name: "Brandon Sanderson"}}))
+	assert.Empty(t, authorDisplayName(nil))
+
+	// Last resort when nothing recorded the original spelling.
+	assert.Equal(t, "David Ludwig", titleCaseName("david ludwig"))
+}
+
+// TestSearchRecordsAuthorName pins the label search writes, which is what the
+// author lookup later reads for display.
+func TestSearchRecordsAuthorName(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	credits := []audnexusPerson{{Name: "David Ludwig MD PhD"}}
+
+	rsc, err := g.searchResource(ctx, testASIN(t), g.authorKeyOf(credits), authorDisplayName(credits))
+	require.NoError(t, err)
+
+	ref, err := g.ids.Ref(ctx, rsc.Author.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "name:david ludwig", ref.asin)
+	assert.Equal(t, "David Ludwig", ref.label)
 }

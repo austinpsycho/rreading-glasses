@@ -12,6 +12,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 // ABGetter implements a getter backed by Audible, via audnexus for normalized
@@ -89,7 +92,7 @@ func (g *ABGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 			// region may still match something by name.
 			Log(ctx).Debug("ASIN lookup missed, falling back to search", "asin", asin, "err", err)
 		} else {
-			rsc, err := g.searchResource(ctx, book.ASIN, g.authorKeyOf(book.Authors))
+			rsc, err := g.searchResource(ctx, book.ASIN, g.authorKeyOf(book.Authors), authorDisplayName(book.Authors))
 			if err != nil {
 				return nil, err
 			}
@@ -108,7 +111,7 @@ func (g *ABGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 		if p.ASIN == "" || len(p.Authors) == 0 {
 			continue // Without an author the client can't do anything with it.
 		}
-		rsc, err := g.searchResource(ctx, p.ASIN, g.authorKeyOf(p.Authors))
+		rsc, err := g.searchResource(ctx, p.ASIN, g.authorKeyOf(p.Authors), authorDisplayName(p.Authors))
 		if err != nil {
 			Log(ctx).Warn("problem mapping search result", "asin", p.ASIN, "err", err)
 			continue
@@ -120,7 +123,7 @@ func (g *ABGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 }
 
 // searchResource mints the three IDs a search result needs.
-func (g *ABGetter) searchResource(ctx context.Context, bookASIN, authASIN string) (SearchResource, error) {
+func (g *ABGetter) searchResource(ctx context.Context, bookASIN, authASIN, authName string) (SearchResource, error) {
 	if authASIN == "" {
 		return SearchResource{}, errors.Join(errNotFound, errors.New("missing author ASIN"))
 	}
@@ -133,7 +136,9 @@ func (g *ABGetter) searchResource(ctx context.Context, bookASIN, authASIN string
 	if err != nil {
 		return SearchResource{}, err
 	}
-	authorID, err := g.ids.ID(ctx, kindAuthor, authASIN, "")
+	// Record the name as written. The key is normalized and lower cased, so
+	// without this the only name available later is "david ludwig".
+	authorID, err := g.ids.ID(ctx, kindAuthor, authASIN, cleanAuthorName(authName))
 	if err != nil {
 		return SearchResource{}, err
 	}
@@ -474,13 +479,19 @@ func (g *ABGetter) authorKeyOf(authors []audnexusPerson) string {
 func (g *ABGetter) authorIdentity(ctx context.Context, key, label string) (string, *audnexusAuthor) {
 	name := label
 	if name == "" {
-		name, _ = authorName(key)
+		normalized, _ := authorName(key)
+		name = titleCaseName(normalized)
 	}
 	if name == "" {
 		return "", nil
 	}
 
-	return name, g.authorDetailByName(ctx, key, name)
+	detail := g.authorDetailByName(ctx, key, name)
+	if detail != nil && detail.Name != "" {
+		// audnexus has the author as they're actually written.
+		name = cleanAuthorName(detail.Name)
+	}
+	return name, detail
 }
 
 // authorDetailByName finds an author's audnexus record by name, once per key.
@@ -826,6 +837,22 @@ var _contributorRole = regexp.MustCompile(
 func authorASIN(authors []audnexusPerson) string {
 	a, _ := primaryAuthor(authors)
 	return authorKey(a)
+}
+
+// authorDisplayName returns the primary author's name as written.
+func authorDisplayName(authors []audnexusPerson) string {
+	primary, ok := primaryAuthor(authors)
+	if !ok {
+		return ""
+	}
+	return cleanAuthorName(primary.Name)
+}
+
+// titleCaseName restores presentable casing for a name recovered from a key.
+// Keys are lower cased for identity, so this is the last resort when nothing
+// recorded how the author is actually written.
+func titleCaseName(name string) string {
+	return cases.Title(language.English).String(name)
 }
 
 // authorURL links to an author's Audible page, or to a search for them when
