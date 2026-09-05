@@ -48,14 +48,6 @@ type ABGetter struct {
 	// visible thing in the UI, so those keep full detail.
 	productMu sync.RWMutex
 	products  map[string]*audibleProduct
-
-	// aliases maps an author's name to their ASIN once we've seen one, so the
-	// titles where Audible omits it join the same author instead of forming a
-	// second, name-keyed one. Without this an author with a mix of credited and
-	// uncredited titles is split in two, and the controller then discards the
-	// uncredited half as belonging to somebody else.
-	aliasMu sync.RWMutex
-	aliases map[string]string
 }
 
 var (
@@ -72,7 +64,6 @@ func NewAudibleGetter(cache cache[[]byte], client *AudibleClient, ids *IDMapper)
 		authors:  map[string]*audnexusAuthor{},
 		ratings:  map[string]*audibleRating{},
 		products: map[string]*audibleProduct{},
-		aliases:  map[string]string{},
 	}, nil
 }
 
@@ -98,7 +89,6 @@ func (g *ABGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 			// region may still match something by name.
 			Log(ctx).Debug("ASIN lookup missed, falling back to search", "asin", asin, "err", err)
 		} else {
-			g.rememberAliases([]audibleProduct{{Authors: book.Authors}})
 			rsc, err := g.searchResource(ctx, book.ASIN, g.authorKeyOf(book.Authors))
 			if err != nil {
 				return nil, err
@@ -112,10 +102,6 @@ func (g *ABGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 		return nil, fmt.Errorf("searching: %w", err)
 	}
 	g.rememberRatings(products)
-
-	// Learn every credited ASIN before minting any IDs, so a title that omits
-	// one still keys to the same author as the titles that carry it.
-	g.rememberAliases(products)
 
 	results := []SearchResource{}
 	for _, p := range products {
@@ -294,47 +280,12 @@ func (g *ABGetter) rating(asin string) *audibleRating {
 	return g.ratings[asin]
 }
 
-// authorDetail returns an author's name, image and bio, fetching each ASIN at
-// most once. A failed lookup is cached as nil so a book by an author audnexus
-// doesn't know about doesn't retry on every subsequent mapping.
-func (g *ABGetter) authorDetail(ctx context.Context, asin string) *audnexusAuthor {
-	// A name-keyed author isn't in audnexus by definition -- the key exists
-	// because Audible gave no ASIN -- so asking would spend a request per book
-	// to get a guaranteed 404.
-	if _, isName := authorName(asin); isName {
-		return nil
-	}
-
-	g.authorMu.RLock()
-	author, ok := g.authors[asin]
-	g.authorMu.RUnlock()
-	if ok {
-		return author
-	}
-
-	author, err := g.client.GetAuthor(ctx, asin)
-	if err != nil {
-		Log(ctx).Debug("no author detail", "asin", asin, "err", err)
-		author = nil
-	}
-
-	g.authorMu.Lock()
-	g.authors[asin] = author
-	g.authorMu.Unlock()
-
-	return author
-}
-
 // mapBook translates an audnexus book into the client's work schema.
 func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResource, error) {
 	primary, ok := primaryAuthor(book.Authors)
 	if !ok {
 		return workResource{}, errors.Join(errNotFound, fmt.Errorf("book %s has no author", book.ASIN))
 	}
-	// Mapping a credited title teaches the name, so an uncredited one mapped
-	// later joins this author instead of forming a twin.
-	g.rememberAlias(primary.Name, primary.ASIN)
-
 	authASIN := g.authorKeyOf(book.Authors)
 
 	workID, err := g.ids.ID(ctx, kindWork, book.ASIN, book.Title)
@@ -345,7 +296,7 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 	if err != nil {
 		return workResource{}, err
 	}
-	authorID, err := g.ids.ID(ctx, kindAuthor, authASIN, primary.Name)
+	authorID, err := g.ids.ID(ctx, kindAuthor, authASIN, cleanAuthorName(primary.Name))
 	if err != nil {
 		return workResource{}, err
 	}
@@ -425,7 +376,7 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 
 	authorRsc := AuthorResource{
 		ForeignID:   authorID,
-		Name:        primary.Name,
+		Name:        cleanAuthorName(primary.Name),
 		Description: "N/A", // Must be set.
 		URL:         authorURL(authASIN),
 		Series:      series,
@@ -434,7 +385,7 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 	// The client renders the author embedded in a work, so search results show
 	// this rather than whatever GetAuthor later returns. Leaving it as a stub
 	// makes every author look empty in search.
-	if detail := g.authorDetail(ctx, authASIN); detail != nil {
+	if detail := g.authorDetailByName(ctx, authASIN, cleanAuthorName(primary.Name)); detail != nil {
 		if detail.Name != "" {
 			authorRsc.Name = detail.Name
 		}
@@ -501,30 +452,6 @@ func (g *ABGetter) mapSeries(ctx context.Context, book *audnexusBook, workID int
 	return series, nil
 }
 
-// rememberAlias records that a name is known to belong to a real ASIN.
-func (g *ABGetter) rememberAlias(name, key string) {
-	name = strings.ToLower(strings.TrimSpace(name))
-	if name == "" || key == "" {
-		return
-	}
-	if _, isName := authorName(key); isName {
-		return // Only a real ASIN is worth aliasing to.
-	}
-
-	g.aliasMu.Lock()
-	defer g.aliasMu.Unlock()
-	g.aliases[name] = key
-}
-
-// rememberAliases records every credited author that carries an ASIN.
-func (g *ABGetter) rememberAliases(products []audibleProduct) {
-	for _, p := range products {
-		for _, a := range p.Authors {
-			g.rememberAlias(a.Name, a.ASIN)
-		}
-	}
-}
-
 // authorKeyOf returns the mapping key for a book's primary author.
 //
 // Every path that mints an author ID has to agree. Search minting a
@@ -536,63 +463,84 @@ func (g *ABGetter) authorKeyOf(authors []audnexusPerson) string {
 	if !ok {
 		return ""
 	}
-	return g.authorKeyFor(primary)
+	return authorKey(primary)
 }
 
-// authorKeyFor returns the mapping key for a credit, preferring an ASIN we've
-// already seen for that name over a name-derived key.
-func (g *ABGetter) authorKeyFor(a audnexusPerson) string {
-	if a.ASIN != "" {
-		return a.ASIN
+// authorIdentity returns the display name for an author key plus, when
+// audnexus can be matched to it, their bio and photo.
+//
+// The lookup is enrichment only. Identity is already settled by the key, so a
+// miss costs a picture rather than changing which author this is.
+func (g *ABGetter) authorIdentity(ctx context.Context, key, label string) (string, *audnexusAuthor) {
+	name := label
+	if name == "" {
+		name, _ = authorName(key)
 	}
-
-	g.aliasMu.RLock()
-	known := g.aliases[strings.ToLower(strings.TrimSpace(a.Name))]
-	g.aliasMu.RUnlock()
-
-	if known != "" {
-		return known
-	}
-	return authorKey(a)
-}
-
-// authorIdentity resolves an author key to a display name, plus audnexus
-// detail when the key is a real ASIN. A name-keyed author has no audnexus
-// record to fetch.
-func (g *ABGetter) authorIdentity(ctx context.Context, key string) (string, *audnexusAuthor) {
-	if name, ok := authorName(key); ok {
-		return name, nil
-	}
-
-	detail := g.authorDetail(ctx, key)
-	if detail == nil {
+	if name == "" {
 		return "", nil
 	}
-	return detail.Name, detail
+
+	return name, g.authorDetailByName(ctx, key, name)
+}
+
+// authorDetailByName finds an author's audnexus record by name, once per key.
+func (g *ABGetter) authorDetailByName(ctx context.Context, key, name string) *audnexusAuthor {
+	g.authorMu.RLock()
+	detail, ok := g.authors[key]
+	g.authorMu.RUnlock()
+	if ok {
+		return detail
+	}
+
+	detail = nil
+	candidates, err := g.client.SearchAuthors(ctx, name)
+	if err != nil {
+		Log(ctx).Debug("no author detail", "name", name, "err", err)
+	}
+
+	// The search is fuzzy -- "David Ludwig MD PhD" also returns "David M.L.
+	// Rabin MD PhD" -- so only an exact match on the normalized name counts.
+	want := normalizeAuthorName(name)
+	for _, c := range candidates {
+		if c.ASIN == "" || normalizeAuthorName(c.Name) != want {
+			continue
+		}
+		if full, err := g.client.GetAuthor(ctx, c.ASIN); err == nil {
+			detail = full
+		}
+		break
+	}
+
+	g.authorMu.Lock()
+	g.authors[key] = detail
+	g.authorMu.Unlock()
+
+	return detail
 }
 
 // GetAuthor returns an author seeded with one of their works.
 func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error) {
-	asin, err := g.ids.ASIN(ctx, kindAuthor, authorID)
+	ref, err := g.ids.Ref(ctx, authorID)
 	if err != nil {
 		return nil, err
 	}
+	if ref.kind != kindAuthor {
+		return nil, errors.Join(errBadRequest, fmt.Errorf("ID %d is not an author", authorID))
+	}
+	asin := ref.asin
 
 	Log(ctx).Debug("getting author", "authorID", authorID, "asin", asin)
 
-	name, detail := g.authorIdentity(ctx, asin)
+	name, detail := g.authorIdentity(ctx, asin, ref.label)
 	if name == "" {
 		return nil, errors.Join(errNotFound, fmt.Errorf("no detail for author %s", asin))
 	}
-
-	g.rememberAlias(name, asin)
 
 	products, _, err := g.client.ProductsByAuthor(ctx, name, 0)
 	if err != nil {
 		return nil, fmt.Errorf("getting author products: %w", err)
 	}
 	g.rememberRatings(products)
-	g.rememberAliases(products)
 
 	description := "N/A" // Must be set.
 	image := ""
@@ -647,21 +595,18 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 // who share a name from bleeding into each other.
 func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[int64] {
 	return func(yield func(int64) bool) {
-		asin, err := g.ids.ASIN(ctx, kindAuthor, authorID)
-		if err != nil {
+		ref, err := g.ids.Ref(ctx, authorID)
+		if err != nil || ref.kind != kindAuthor {
 			Log(ctx).Warn("unknown author ID", "authorID", authorID, "err", err)
 			return
 		}
+		asin := ref.asin
 
-		name, _ := g.authorIdentity(ctx, asin)
+		name, _ := g.authorIdentity(ctx, asin, ref.label)
 		if name == "" {
 			Log(ctx).Warn("no identity for author", "asin", asin)
 			return
 		}
-
-		// Claim the name before mapping any books, so this author's untagged
-		// titles resolve to them rather than minting a name-keyed twin.
-		g.rememberAlias(name, asin)
 
 		seen := map[string]bool{}
 
@@ -680,7 +625,6 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 			}
 			g.rememberRatings(products)
 			g.rememberProducts(products)
-			g.rememberAliases(products)
 
 			for _, p := range products {
 				if p.ASIN == "" || seen[p.ASIN] || !p.creditsAuthor(asin, name) {
@@ -818,25 +762,55 @@ func primaryAuthor(authors []audnexusPerson) (audnexusPerson, bool) {
 
 // authorKey returns the mapping key for an author.
 //
-// Audible frequently omits the author's ASIN -- the canonical Hitchhiker's
-// Guide and Restaurant at the End of the Universe both have none -- and
-// requiring one dropped roughly a third of the catalog outright. It also
-// lists the same person under several ASINs, which splits a bibliography
-// across authors. Falling back to the name keeps those books, and is what
-// Audible's own author filter matches on anyway.
+// Identity is the author's normalized name, never their ASIN. Audible omits
+// the ASIN on roughly a third of titles, lists the same person under several,
+// and credits them under varying names -- "David Ludwig", "David Ludwig MD
+// PhD", even "David Ludwig MD PhD MD PhD" -- so anything keyed on ASINs
+// either drops books or splits one author across entries. Keying on the name
+// is deterministic and order-independent, which an ASIN cache resolved as we
+// went could never be.
+//
+// Two different authors who share a name therefore merge. That is the
+// deliberate trade: one entry holding everything beats hunting the same
+// author's books across several.
 func authorKey(a audnexusPerson) string {
-	if a.ASIN != "" {
-		return a.ASIN
+	name := normalizeAuthorName(a.Name)
+	if name == "" {
+		return ""
 	}
-	if name := strings.TrimSpace(a.Name); name != "" {
-		return _authorNameKey + strings.ToLower(name)
-	}
-	return ""
+	return _authorNameKey + name
 }
 
-// _authorNameKey prefixes a name-derived key so it can't collide with an ASIN
-// and so the lookup path can tell the two apart.
+// _authorNameKey prefixes a name-derived key so it can't be mistaken for an
+// ASIN and so the lookup path can tell the two apart.
 const _authorNameKey = "name:"
+
+// _authorCredentials matches the honorifics and post-nominals Audible appends
+// to a credit, which vary between titles by the same author.
+var _authorCredentials = regexp.MustCompile(
+	`(?i)[,\s]+(m\.?d\.?|ph\.?d\.?|psy\.?d\.?|ed\.?d\.?|d\.?o\.?|d\.?d\.?s\.?|r\.?n\.?|m\.?b\.?a\.?|m\.?s\.?w?\.?|m\.?a\.?|j\.?d\.?|l\.?c\.?s\.?w\.?|esq\.?|jr\.?|sr\.?|i{2,3}|iv)\.?$`)
+
+// cleanAuthorName strips the role and credentials Audible appends, keeping the
+// name as written otherwise so it stays presentable.
+func cleanAuthorName(raw string) string {
+	name := strings.TrimSpace(_contributorRole.ReplaceAllString(strings.TrimSpace(raw), ""))
+
+	// Repeated because credentials stack, and Audible sometimes repeats them.
+	for {
+		stripped := strings.TrimSpace(_authorCredentials.ReplaceAllString(name, ""))
+		if stripped == name || stripped == "" {
+			break
+		}
+		name = stripped
+	}
+
+	return strings.Join(strings.Fields(name), " ")
+}
+
+// normalizeAuthorName reduces a credit to the form used for identity.
+func normalizeAuthorName(raw string) string {
+	return strings.ToLower(cleanAuthorName(raw))
+}
 
 // authorName recovers the name from a name-derived key.
 func authorName(key string) (string, bool) {

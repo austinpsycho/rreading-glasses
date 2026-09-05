@@ -20,15 +20,18 @@ func newTestAudibleGetter(t *testing.T) *ABGetter {
 	g, err := NewAudibleGetter(cache, NewAudibleClient("api.audnex.us", "api.audible.com", "us", 0), ids)
 	require.NoError(t, err)
 
-	// Seed author detail so mapping doesn't reach the network. A nil entry is
-	// a cached miss, which is what an author audnexus doesn't know looks like.
-	g.authors["B001IGFHW6"] = &audnexusAuthor{
+	// Seed author detail so mapping doesn't reach the network. Detail is keyed
+	// by author key, not ASIN. A nil entry is a cached miss, which is what an
+	// author audnexus has no record of looks like.
+	g.authors["name:brandon sanderson"] = &audnexusAuthor{
 		ASIN:        "B001IGFHW6",
 		Name:        "Brandon Sanderson",
 		Description: "Epic fantasy author.",
 		Image:       "https://m.media-amazon.com/images/I/author.jpg",
 	}
-	g.authors["B0UNKNOWN1"] = nil
+	g.authors["name:obscure author"] = nil
+	g.authors["name:henry james"] = nil
+	g.authors["name:david ludwig"] = nil
 
 	return g
 }
@@ -123,7 +126,7 @@ func TestAudibleEmbeddedAuthorUnknown(t *testing.T) {
 	ctx := t.Context()
 
 	book := testBook(testASIN(t))
-	book.Authors = []audnexusPerson{{ASIN: "B0UNKNOWN1", Name: "Obscure Author"}}
+	book.Authors = []audnexusPerson{{Name: "Obscure Author"}}
 
 	work, err := g.mapBook(ctx, book)
 	require.NoError(t, err)
@@ -330,12 +333,11 @@ func TestAudibleProductHelpers(t *testing.T) {
 	})
 
 	t.Run("matches authors by key or name", func(t *testing.T) {
-		assert.True(t, p.creditsAuthor("B001IGFHW6", ""))
-		assert.True(t, p.creditsAuthor("b001igfhw6", ""))
-		assert.False(t, p.creditsAuthor("B0719B6Z8Y", ""))
+		assert.True(t, p.creditsAuthor("name:brandon sanderson", ""))
+		assert.False(t, p.creditsAuthor("name:someone else", ""))
 
-		// Audible omits the ASIN on many titles and lists one person under
-		// several, so a name match has to count too.
+		// The walk also matches by name, since Audible varies how it credits
+		// the same person between titles.
 		assert.True(t, p.creditsAuthor("", "Brandon Sanderson"))
 		assert.False(t, p.creditsAuthor("", "Someone Else"))
 	})
@@ -343,23 +345,6 @@ func TestAudibleProductHelpers(t *testing.T) {
 	t.Run("handles missing images", func(t *testing.T) {
 		assert.Empty(t, audibleProduct{}.imageURL())
 	})
-}
-
-func TestAuthorASIN(t *testing.T) {
-	t.Parallel()
-
-	assert.Empty(t, authorASIN(nil))
-	assert.Empty(t, authorASIN([]audnexusPerson{{}}))
-
-	// A named credit with no ASIN keys on the name rather than being dropped.
-	assert.Equal(t, "name:no asin", authorASIN([]audnexusPerson{{Name: "No ASIN"}}))
-
-	// Co-authors are common and the first credited ASIN wins.
-	assert.Equal(t, "B002", authorASIN([]audnexusPerson{
-		{Name: "Contributor"},
-		{ASIN: "B002", Name: "Author"},
-		{ASIN: "B003", Name: "Co-author"},
-	}))
 }
 
 func TestPersonNames(t *testing.T) {
@@ -477,40 +462,6 @@ func TestWorkResourcePrefersProduct(t *testing.T) {
 	assert.Equal(t, asin, work.Books[0].Asin)
 }
 
-// TestAuthorIdentityNotMixed covers a co-authored book whose first credit has
-// no ASIN. The name and the ASIN must describe the same person: taking the
-// name from one entry and the ID from another files one author's books under
-// another author's name.
-func TestAuthorIdentityNotMixed(t *testing.T) {
-	g := newTestAudibleGetter(t)
-	ctx := t.Context()
-
-	g.authors["B0COAUTHOR"] = &audnexusAuthor{ASIN: "B0COAUTHOR", Name: "Real Author"}
-
-	book := testBook(testASIN(t))
-	book.Authors = []audnexusPerson{
-		{Name: "Uncredited Contributor"}, // no ASIN
-		{ASIN: "B0COAUTHOR", Name: "Real Author"},
-	}
-
-	work, err := g.mapBook(ctx, book)
-	require.NoError(t, err)
-
-	author := work.Authors[0]
-	assert.Equal(t, "Real Author", author.Name, "name must match the ASIN it was minted from")
-
-	// The surrogate ID must belong to the same person as the name.
-	expected, err := g.ids.ID(ctx, kindAuthor, "B0COAUTHOR", "")
-	require.NoError(t, err)
-	assert.Equal(t, expected, author.ForeignID)
-
-	// And the recorded label must not be the other contributor's name.
-	ref, err := g.ids.Ref(ctx, author.ForeignID)
-	require.NoError(t, err)
-	assert.Equal(t, "B0COAUTHOR", ref.asin)
-	assert.NotEqual(t, "Uncredited Contributor", ref.label)
-}
-
 func TestPrimaryAuthor(t *testing.T) {
 	t.Parallel()
 
@@ -567,29 +518,6 @@ func TestPrimaryAuthorSkipsContributors(t *testing.T) {
 	assert.False(t, _contributorRole.MatchString("Editor Jones"))
 }
 
-// TestAuthorKeyFallsBackToName covers Audible titles credited to a named
-// author with no ASIN -- the first two Hitchhiker's Guide novels among them.
-// Requiring an ASIN dropped those books from the library entirely.
-func TestAuthorKeyFallsBackToName(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, "B000AQ2A84", authorKey(audnexusPerson{ASIN: "B000AQ2A84", Name: "Douglas Adams"}))
-	assert.Equal(t, "name:douglas adams", authorKey(audnexusPerson{Name: "Douglas Adams"}))
-	assert.Equal(t, "name:douglas adams", authorKey(audnexusPerson{Name: " Douglas ADAMS "}))
-	assert.Empty(t, authorKey(audnexusPerson{}))
-
-	name, ok := authorName("name:douglas adams")
-	assert.True(t, ok)
-	assert.Equal(t, "douglas adams", name)
-
-	_, ok = authorName("B000AQ2A84")
-	assert.False(t, ok)
-
-	// Both forms must produce a link; see TestAuthorURLNeverEmpty.
-	assert.NotEmpty(t, authorURL("name:douglas adams"))
-	assert.NotEmpty(t, authorURL("B000AQ2A84"))
-}
-
 // TestBookWithoutAuthorASIN is the Hitchhiker's Guide case: a real author, no
 // ASIN. The book must still map rather than being dropped.
 func TestBookWithoutAuthorASIN(t *testing.T) {
@@ -622,71 +550,74 @@ func TestAuthorURLNeverEmpty(t *testing.T) {
 	assert.Contains(t, authorURL("name:douglas adams"), "douglas+adams")
 }
 
-// TestAuthorAliasJoinsUntaggedTitles covers an author with a mix of credited
-// and uncredited titles. Both must resolve to one author: otherwise the
-// uncredited half forms a name-keyed twin, and the controller discards those
-// books from the real author as belonging to someone else.
-func TestAuthorAliasJoinsUntaggedTitles(t *testing.T) {
+// TestAuthorKeyIsTheName pins author identity to the normalized name. Audible
+// omits the ASIN on many titles, lists one person under several, and varies
+// the name with credentials, so anything keyed on ASINs either drops books or
+// splits an author across entries.
+func TestAuthorKeyIsTheName(t *testing.T) {
+	t.Parallel()
+
+	// The ASIN is deliberately ignored.
+	assert.Equal(t, "name:douglas adams",
+		authorKey(audnexusPerson{ASIN: "B000AQ2A84", Name: "Douglas Adams"}))
+	assert.Equal(t, "name:douglas adams", authorKey(audnexusPerson{Name: "Douglas Adams"}))
+	assert.Equal(t, "name:douglas adams", authorKey(audnexusPerson{Name: " Douglas  ADAMS "}))
+	assert.Empty(t, authorKey(audnexusPerson{}))
+
+	// Credentials vary between titles by one author and must not split them.
+	for _, name := range []string{
+		"David Ludwig", "David Ludwig MD", "David Ludwig MD PhD",
+		"David Ludwig MD PhD MD PhD", "David Ludwig, PhD", "David Ludwig - editor",
+	} {
+		assert.Equal(t, "name:david ludwig", authorKey(audnexusPerson{Name: name}), name)
+	}
+
+	name, ok := authorName("name:douglas adams")
+	assert.True(t, ok)
+	assert.Equal(t, "douglas adams", name)
+
+	assert.NotEmpty(t, authorURL("name:douglas adams"))
+}
+
+// TestAuthorKeyIsOrderIndependent is the property the alias table could not
+// provide: a credit resolves the same way regardless of what was seen first,
+// so an author can't be split by fetch order.
+func TestAuthorKeyIsOrderIndependent(t *testing.T) {
 	g := newTestAudibleGetter(t)
 	ctx := t.Context()
 
-	g.authors["B000APYNL2"] = &audnexusAuthor{ASIN: "B000APYNL2", Name: "Henry James"}
+	credits := [][]audnexusPerson{
+		{{ASIN: "B000APYNL2", Name: "Henry James"}},
+		{{Name: "Henry James"}},
+		{{Name: "Henry James MD"}},
+		{{ASIN: "B0OTHERASIN", Name: "henry james"}},
+	}
 
-	// A title that does carry the ASIN.
-	tagged := testBook(testASIN(t))
-	tagged.Authors = []audnexusPerson{{ASIN: "B000APYNL2", Name: "Henry James"}}
+	var first int64
+	for i, credit := range credits {
+		book := testBook(testASIN(t))
+		book.Authors = credit
 
-	taggedWork, err := g.mapBook(ctx, tagged)
-	require.NoError(t, err)
+		work, err := g.mapBook(ctx, book)
+		require.NoError(t, err)
 
-	// One that doesn't.
-	untagged := testBook(testASIN(t))
-	untagged.Authors = []audnexusPerson{{Name: "Henry James"}}
-
-	untaggedWork, err := g.mapBook(ctx, untagged)
-	require.NoError(t, err)
-
-	assert.Equal(t, taggedWork.Authors[0].ForeignID, untaggedWork.Authors[0].ForeignID,
-		"an untagged title must join the author it belongs to")
+		if i == 0 {
+			first = work.Authors[0].ForeignID
+			continue
+		}
+		assert.Equal(t, first, work.Authors[0].ForeignID,
+			"credit %d must resolve to the same author", i)
+	}
 }
 
-func TestAuthorKeyForPrefersKnownASIN(t *testing.T) {
-	g := newTestAudibleGetter(t)
-
-	// Unknown name: keyed by name.
-	assert.Equal(t, "name:someone new", g.authorKeyFor(audnexusPerson{Name: "Someone New"}))
-
-	g.rememberAlias("Douglas Adams", "B000AQ2A84")
-	assert.Equal(t, "B000AQ2A84", g.authorKeyFor(audnexusPerson{Name: "douglas adams"}))
-
-	// An explicit ASIN always wins over the alias.
-	assert.Equal(t, "B0H535WGMP",
-		g.authorKeyFor(audnexusPerson{ASIN: "B0H535WGMP", Name: "Douglas Adams"}))
-
-	// A name-derived key is never aliased to.
-	g.rememberAlias("Nobody", "name:nobody")
-	assert.Equal(t, "name:nobody", g.authorKeyFor(audnexusPerson{Name: "Nobody"}))
-}
-
-// TestSearchAndMapAgreeOnAuthor pins the invariant that broke when search and
-// book mapping keyed authors differently: search minted a name-derived ID
-// while the work it pointed at mapped to an aliased ASIN, so GetAuthor found
-// no works for the ID the client had been given and reported the author as
-// missing.
+// TestSearchAndMapAgreeOnAuthor pins search and mapping to one author ID. When
+// they disagreed, GetAuthor found no works for the ID the client had been
+// given and reported the author as missing.
 func TestSearchAndMapAgreeOnAuthor(t *testing.T) {
 	g := newTestAudibleGetter(t)
 	ctx := t.Context()
 
-	g.authors["B0LUDWIG001"] = &audnexusAuthor{ASIN: "B0LUDWIG001", Name: "David Ludwig"}
-
-	// A credited title establishes the alias, as a catalog listing would.
-	g.rememberAliases([]audibleProduct{{
-		ASIN:    "B0TAGGED001",
-		Authors: []audnexusPerson{{ASIN: "B0LUDWIG001", Name: "David Ludwig"}},
-	}})
-
-	// An uncredited title: what search and mapping each make of it must match.
-	credits := []audnexusPerson{{Name: "David Ludwig"}}
+	credits := []audnexusPerson{{Name: "David Ludwig MD PhD"}}
 
 	rsc, err := g.searchResource(ctx, testASIN(t), g.authorKeyOf(credits))
 	require.NoError(t, err)
@@ -697,6 +628,6 @@ func TestSearchAndMapAgreeOnAuthor(t *testing.T) {
 	work, err := g.mapBook(ctx, book)
 	require.NoError(t, err)
 
-	assert.Equal(t, rsc.Author.ID, work.Authors[0].ForeignID,
-		"search and mapping must mint the same author ID")
+	assert.Equal(t, rsc.Author.ID, work.Authors[0].ForeignID)
+	assert.Equal(t, "David Ludwig", work.Authors[0].Name, "credentials are stripped for display")
 }

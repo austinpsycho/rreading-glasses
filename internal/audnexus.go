@@ -312,6 +312,21 @@ func (c *AudibleClient) GetAuthor(ctx context.Context, asin string) (*audnexusAu
 	return &author, nil
 }
 
+// SearchAuthors finds audnexus authors by name. Results are fuzzy and often
+// repeat the same author, so callers must match before trusting one.
+func (c *AudibleClient) SearchAuthors(ctx context.Context, name string) ([]audnexusAuthor, error) {
+	params := url.Values{}
+	params.Set("name", name)
+	params.Set("region", c.region)
+
+	var authors []audnexusAuthor
+	u := fmt.Sprintf("https://%s/authors?%s", c.audnexusHost, params.Encode())
+	if err := c.get(ctx, c.audnexus, u, &authors); err != nil {
+		return nil, err
+	}
+	return authors, nil
+}
+
 // SearchProducts runs a natural language query against Audible's catalog.
 func (c *AudibleClient) SearchProducts(ctx context.Context, query string, limit int) ([]audibleProduct, error) {
 	params := url.Values{}
