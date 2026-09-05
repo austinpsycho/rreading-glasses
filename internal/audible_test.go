@@ -15,10 +15,7 @@ import (
 func newTestAudibleGetter(t *testing.T) *ABGetter {
 	t.Helper()
 
-	ids, ctx := newTestMapper(t)
-
-	cache, err := NewCache(ctx, testDSN, nil, nil)
-	require.NoError(t, err)
+	ids, cache := testDeps(t)
 
 	g, err := NewAudibleGetter(cache, NewAudibleClient("api.audnex.us", "api.audible.com", "us", 0), ids)
 	require.NoError(t, err)
@@ -453,10 +450,8 @@ func TestProductAsBook(t *testing.T) {
 // instead of an audnexus request. The test client points at a host that
 // doesn't resolve, so a lookup would fail rather than silently pass.
 func TestWorkResourcePrefersProduct(t *testing.T) {
-	ids, ctx := newTestMapper(t)
-
-	cache, err := NewCache(ctx, testDSN, nil, nil)
-	require.NoError(t, err)
+	ids, cache := testDeps(t)
+	ctx := t.Context()
 
 	g, err := NewAudibleGetter(cache, NewAudibleClient("invalid.invalid", "invalid.invalid", "us", 0), ids)
 	require.NoError(t, err)
@@ -527,4 +522,36 @@ func TestPrimaryAuthor(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "B002", a.ASIN)
 	assert.Equal(t, "Author", a.Name, "name and ASIN must come from one entry")
+}
+
+// TestPrimaryAuthorSkipsContributors covers Audible's role suffixes. An
+// anthology often credits its editor first, and treating that as the author
+// files the book under the wrong person and gives the editor a bibliography of
+// their own for the controller to walk.
+func TestPrimaryAuthorSkipsContributors(t *testing.T) {
+	t.Parallel()
+
+	a, ok := primaryAuthor([]audnexusPerson{
+		{ASIN: "B0EDITOR001", Name: "Shawn Speakman - editor"},
+		{ASIN: "B0TRANS0001", Name: "Constance Garnett - translator"},
+		{ASIN: "B0AUTHOR001", Name: "Ursula K. Le Guin"},
+	})
+	require.True(t, ok)
+	assert.Equal(t, "Ursula K. Le Guin", a.Name)
+
+	// Credited only to an editor: the book still needs an author.
+	a, ok = primaryAuthor([]audnexusPerson{
+		{ASIN: "B0EDITOR001", Name: "Shawn Speakman - editor"},
+	})
+	require.True(t, ok)
+	assert.Equal(t, "B0EDITOR001", a.ASIN)
+
+	for _, name := range []string{
+		"Someone - editor", "Someone - translator", "Someone - adaptation",
+		"Someone - introduction", "Someone - contributor", "Someone - foreword",
+	} {
+		assert.True(t, _contributorRole.MatchString(name), name)
+	}
+	assert.False(t, _contributorRole.MatchString("Ursula K. Le Guin"))
+	assert.False(t, _contributorRole.MatchString("Editor Jones"))
 }

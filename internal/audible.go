@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -674,13 +675,29 @@ func (g *ABGetter) Recommendations(ctx context.Context, page int64) (Recommentat
 // builds an identity out of two different people -- one author's name against
 // another author's ID and bibliography.
 func primaryAuthor(authors []audnexusPerson) (audnexusPerson, bool) {
+	// Prefer a credit that isn't an editor, translator or similar. Audible
+	// appends the role to the name ("Shawn Speakman - editor"), and anthologies
+	// often list one first, which would otherwise make every editor an author
+	// with a bibliography of their own to walk.
+	for _, a := range authors {
+		if a.ASIN != "" && !_contributorRole.MatchString(a.Name) {
+			return a, true
+		}
+	}
+
+	// A book credited only to an editor still needs someone to hang it on.
 	for _, a := range authors {
 		if a.ASIN != "" {
 			return a, true
 		}
 	}
+
 	return audnexusPerson{}, false
 }
+
+// _contributorRole matches the role Audible appends to a non-author credit.
+var _contributorRole = regexp.MustCompile(
+	`(?i) - (editor|translator|adaptation|adapted by|introduction|contributor|foreword|afterword|illustrator|narrator|preface|compiler|annotations?|notes)$`)
 
 // authorASIN returns the first author with an ASIN.
 func authorASIN(authors []audnexusPerson) string {

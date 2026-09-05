@@ -23,12 +23,37 @@ func testASIN(t *testing.T) string {
 	return fmt.Sprintf("B%09d", rand.IntN(1_000_000_000))
 }
 
+// Each IDMapper and Cache opens its own pgx pool with MaxConns of 25, so
+// building them per test exhausts Postgres's connection limit once there are
+// more than a handful -- which hangs the run rather than failing it. They hold
+// no per-test state, so one set is shared.
+var (
+	_testDepsOnce sync.Once
+	_testMapper   *IDMapper
+	_testCache    cache[[]byte]
+	_testDepsErr  error
+)
+
+func testDeps(t *testing.T) (*IDMapper, cache[[]byte]) {
+	t.Helper()
+
+	_testDepsOnce.Do(func() {
+		ctx := context.Background()
+		_testMapper, _testDepsErr = NewIDMapper(ctx, testDSN)
+		if _testDepsErr != nil {
+			return
+		}
+		_testCache, _testDepsErr = NewCache(ctx, testDSN, nil, nil)
+	})
+
+	require.NoError(t, _testDepsErr)
+	return _testMapper, _testCache
+}
+
 func newTestMapper(t *testing.T) (*IDMapper, context.Context) {
 	t.Helper()
-	ctx := t.Context()
-	m, err := NewIDMapper(ctx, testDSN)
-	require.NoError(t, err)
-	return m, ctx
+	m, _ := testDeps(t)
+	return m, t.Context()
 }
 
 func TestIDMapper(t *testing.T) {
