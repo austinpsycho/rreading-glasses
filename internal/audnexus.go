@@ -407,10 +407,20 @@ func (p audibleProduct) imageURL() string {
 	return best
 }
 
-// hasAuthor reports whether the product is credited to the given author ASIN.
-func (p audibleProduct) hasAuthor(asin string) bool {
+// creditsAuthor reports whether the product is credited to the given author,
+// by mapping key or by name.
+//
+// Name matching is not redundant: Audible lists the same person under several
+// ASINs and omits it entirely on many titles, so an ASIN-only check drops
+// books that plainly belong to the author -- the first two Hitchhiker's Guide
+// novels among them. Audible's own author filter matches on name, so this
+// agrees with the listing that produced these products.
+func (p audibleProduct) creditsAuthor(key, name string) bool {
 	for _, a := range p.Authors {
-		if strings.EqualFold(a.ASIN, asin) {
+		if key != "" && strings.EqualFold(authorKey(a), key) {
+			return true
+		}
+		if name != "" && strings.EqualFold(strings.TrimSpace(a.Name), name) {
 			return true
 		}
 	}

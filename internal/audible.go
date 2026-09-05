@@ -283,6 +283,13 @@ func (g *ABGetter) rating(asin string) *audibleRating {
 // most once. A failed lookup is cached as nil so a book by an author audnexus
 // doesn't know about doesn't retry on every subsequent mapping.
 func (g *ABGetter) authorDetail(ctx context.Context, asin string) *audnexusAuthor {
+	// A name-keyed author isn't in audnexus by definition -- the key exists
+	// because Audible gave no ASIN -- so asking would spend a request per book
+	// to get a guaranteed 404.
+	if _, isName := authorName(asin); isName {
+		return nil
+	}
+
 	g.authorMu.RLock()
 	author, ok := g.authors[asin]
 	g.authorMu.RUnlock()
@@ -309,7 +316,7 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 	if !ok {
 		return workResource{}, errors.Join(errNotFound, fmt.Errorf("book %s has no author", book.ASIN))
 	}
-	authASIN := primary.ASIN
+	authASIN := authorKey(primary)
 
 	workID, err := g.ids.ID(ctx, kindWork, book.ASIN, book.Title)
 	if err != nil {
@@ -401,7 +408,7 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 		ForeignID:   authorID,
 		Name:        primary.Name,
 		Description: "N/A", // Must be set.
-		URL:         audibleURL(authASIN),
+		URL:         authorURL(authASIN),
 		Series:      series,
 	}
 
@@ -475,6 +482,21 @@ func (g *ABGetter) mapSeries(ctx context.Context, book *audnexusBook, workID int
 	return series, nil
 }
 
+// authorIdentity resolves an author key to a display name, plus audnexus
+// detail when the key is a real ASIN. A name-keyed author has no audnexus
+// record to fetch.
+func (g *ABGetter) authorIdentity(ctx context.Context, key string) (string, *audnexusAuthor) {
+	if name, ok := authorName(key); ok {
+		return name, nil
+	}
+
+	detail := g.authorDetail(ctx, key)
+	if detail == nil {
+		return "", nil
+	}
+	return detail.Name, detail
+}
+
 // GetAuthor returns an author seeded with one of their works.
 func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error) {
 	asin, err := g.ids.ASIN(ctx, kindAuthor, authorID)
@@ -484,26 +506,30 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 
 	Log(ctx).Debug("getting author", "authorID", authorID, "asin", asin)
 
-	author := g.authorDetail(ctx, asin)
-	if author == nil {
+	name, detail := g.authorIdentity(ctx, asin)
+	if name == "" {
 		return nil, errors.Join(errNotFound, fmt.Errorf("no detail for author %s", asin))
 	}
 
-	products, _, err := g.client.ProductsByAuthor(ctx, author.Name, 0)
+	products, _, err := g.client.ProductsByAuthor(ctx, name, 0)
 	if err != nil {
 		return nil, fmt.Errorf("getting author products: %w", err)
 	}
 	g.rememberRatings(products)
 
-	description := author.Description
-	if description == "" {
-		description = "N/A" // Must be set.
+	description := "N/A" // Must be set.
+	image := ""
+	if detail != nil {
+		if detail.Description != "" {
+			description = detail.Description
+		}
+		image = detail.Image
 	}
 
 	// Seed the author with the first work we can actually load. The controller
 	// backfills the rest from GetAuthorBooks.
 	for _, p := range products {
-		if !p.hasAuthor(asin) {
+		if !p.creditsAuthor(asin, name) {
 			continue
 		}
 
@@ -524,10 +550,10 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 		}
 
 		authorRsc := work.Authors[0]
-		authorRsc.Name = author.Name
+		authorRsc.Name = name
 		authorRsc.Description = description
-		authorRsc.ImageURL = author.Image
-		authorRsc.URL = audibleURL(asin)
+		authorRsc.ImageURL = image
+		authorRsc.URL = authorURL(asin)
 		authorRsc.Works = []workResource{work}
 
 		return json.Marshal(authorRsc)
@@ -550,9 +576,9 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 			return
 		}
 
-		author, err := g.client.GetAuthor(ctx, asin)
-		if err != nil {
-			Log(ctx).Warn("problem getting author", "asin", asin, "err", err)
+		name, _ := g.authorIdentity(ctx, asin)
+		if name == "" {
+			Log(ctx).Warn("no identity for author", "asin", asin)
 			return
 		}
 
@@ -563,7 +589,7 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 		// page of books, and returns nothing at all for authors with fewer
 		// than num_results titles.
 		for page := 0; ; page++ {
-			products, total, err := g.client.ProductsByAuthor(ctx, author.Name, page)
+			products, total, err := g.client.ProductsByAuthor(ctx, name, page)
 			if err != nil {
 				Log(ctx).Warn("problem getting author products", "asin", asin, "page", page, "err", err)
 				return
@@ -575,7 +601,7 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 			g.rememberProducts(products)
 
 			for _, p := range products {
-				if p.ASIN == "" || seen[p.ASIN] || !p.hasAuthor(asin) {
+				if p.ASIN == "" || seen[p.ASIN] || !p.creditsAuthor(asin, name) {
 					continue
 				}
 				seen[p.ASIN] = true
@@ -679,8 +705,16 @@ func primaryAuthor(authors []audnexusPerson) (audnexusPerson, bool) {
 	// appends the role to the name ("Shawn Speakman - editor"), and anthologies
 	// often list one first, which would otherwise make every editor an author
 	// with a bibliography of their own to walk.
+	// A credit carrying a real ASIN is the strongest signal, so an anthology
+	// that lists an uncredited contributor first still resolves to the author
+	// Audible actually identifies.
 	for _, a := range authors {
 		if a.ASIN != "" && !_contributorRole.MatchString(a.Name) {
+			return a, true
+		}
+	}
+	for _, a := range authors {
+		if authorKey(a) != "" && !_contributorRole.MatchString(a.Name) {
 			return a, true
 		}
 	}
@@ -691,18 +725,59 @@ func primaryAuthor(authors []audnexusPerson) (audnexusPerson, bool) {
 			return a, true
 		}
 	}
+	for _, a := range authors {
+		if authorKey(a) != "" {
+			return a, true
+		}
+	}
 
 	return audnexusPerson{}, false
+}
+
+// authorKey returns the mapping key for an author.
+//
+// Audible frequently omits the author's ASIN -- the canonical Hitchhiker's
+// Guide and Restaurant at the End of the Universe both have none -- and
+// requiring one dropped roughly a third of the catalog outright. It also
+// lists the same person under several ASINs, which splits a bibliography
+// across authors. Falling back to the name keeps those books, and is what
+// Audible's own author filter matches on anyway.
+func authorKey(a audnexusPerson) string {
+	if a.ASIN != "" {
+		return a.ASIN
+	}
+	if name := strings.TrimSpace(a.Name); name != "" {
+		return _authorNameKey + strings.ToLower(name)
+	}
+	return ""
+}
+
+// _authorNameKey prefixes a name-derived key so it can't collide with an ASIN
+// and so the lookup path can tell the two apart.
+const _authorNameKey = "name:"
+
+// authorName recovers the name from a name-derived key.
+func authorName(key string) (string, bool) {
+	name, ok := strings.CutPrefix(key, _authorNameKey)
+	return name, ok
 }
 
 // _contributorRole matches the role Audible appends to a non-author credit.
 var _contributorRole = regexp.MustCompile(
 	`(?i) - (editor|translator|adaptation|adapted by|introduction|contributor|foreword|afterword|illustrator|narrator|preface|compiler|annotations?|notes)$`)
 
-// authorASIN returns the first author with an ASIN.
+// authorASIN returns the mapping key for a book's primary author.
 func authorASIN(authors []audnexusPerson) string {
 	a, _ := primaryAuthor(authors)
-	return a.ASIN
+	return authorKey(a)
+}
+
+// authorURL links to an author's Audible page when there's a real ASIN for it.
+func authorURL(key string) string {
+	if _, isName := authorName(key); isName {
+		return ""
+	}
+	return audibleURL(key)
 }
 
 func personNames(people []audnexusPerson) []string {

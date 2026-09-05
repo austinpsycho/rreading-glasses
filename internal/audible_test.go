@@ -185,11 +185,11 @@ func TestAudibleBookWithoutAuthor(t *testing.T) {
 	g := newTestAudibleGetter(t)
 	ctx := t.Context()
 
-	// Audible occasionally credits contributors with no ASIN. The client can't
-	// do anything with an authorless work, so this must fail rather than
-	// produce one.
+	// A work with no identifiable author at all is unusable to the client, so
+	// this must fail rather than produce one. A credit with only a name is
+	// still an author -- see TestBookWithoutAuthorASIN.
 	book := testBook(testASIN(t))
-	book.Authors = []audnexusPerson{{Name: "Nobody"}}
+	book.Authors = []audnexusPerson{{}}
 
 	_, err := g.mapBook(ctx, book)
 	require.Error(t, err)
@@ -329,12 +329,15 @@ func TestAudibleProductHelpers(t *testing.T) {
 		assert.Equal(t, "https://example.invalid/1024.jpg", p.imageURL())
 	})
 
-	t.Run("matches authors by ASIN", func(t *testing.T) {
-		// Audible only filters the catalog by name, so this is what keeps two
-		// authors sharing a name out of each other's bibliographies.
-		assert.True(t, p.hasAuthor("B001IGFHW6"))
-		assert.True(t, p.hasAuthor("b001igfhw6"))
-		assert.False(t, p.hasAuthor("B0719B6Z8Y"))
+	t.Run("matches authors by key or name", func(t *testing.T) {
+		assert.True(t, p.creditsAuthor("B001IGFHW6", ""))
+		assert.True(t, p.creditsAuthor("b001igfhw6", ""))
+		assert.False(t, p.creditsAuthor("B0719B6Z8Y", ""))
+
+		// Audible omits the ASIN on many titles and lists one person under
+		// several, so a name match has to count too.
+		assert.True(t, p.creditsAuthor("", "Brandon Sanderson"))
+		assert.False(t, p.creditsAuthor("", "Someone Else"))
 	})
 
 	t.Run("handles missing images", func(t *testing.T) {
@@ -346,7 +349,10 @@ func TestAuthorASIN(t *testing.T) {
 	t.Parallel()
 
 	assert.Empty(t, authorASIN(nil))
-	assert.Empty(t, authorASIN([]audnexusPerson{{Name: "No ASIN"}}))
+	assert.Empty(t, authorASIN([]audnexusPerson{{}}))
+
+	// A named credit with no ASIN keys on the name rather than being dropped.
+	assert.Equal(t, "name:no asin", authorASIN([]audnexusPerson{{Name: "No ASIN"}}))
 
 	// Co-authors are common and the first credited ASIN wins.
 	assert.Equal(t, "B002", authorASIN([]audnexusPerson{
@@ -511,7 +517,12 @@ func TestPrimaryAuthor(t *testing.T) {
 	_, ok := primaryAuthor(nil)
 	assert.False(t, ok)
 
-	_, ok = primaryAuthor([]audnexusPerson{{Name: "No ASIN"}})
+	// A name with no ASIN is still an author; only an empty credit isn't.
+	a0, ok := primaryAuthor([]audnexusPerson{{Name: "No ASIN"}})
+	require.True(t, ok)
+	assert.Equal(t, "No ASIN", a0.Name)
+
+	_, ok = primaryAuthor([]audnexusPerson{{}})
 	assert.False(t, ok)
 
 	a, ok := primaryAuthor([]audnexusPerson{
@@ -554,4 +565,48 @@ func TestPrimaryAuthorSkipsContributors(t *testing.T) {
 	}
 	assert.False(t, _contributorRole.MatchString("Ursula K. Le Guin"))
 	assert.False(t, _contributorRole.MatchString("Editor Jones"))
+}
+
+// TestAuthorKeyFallsBackToName covers Audible titles credited to a named
+// author with no ASIN -- the first two Hitchhiker's Guide novels among them.
+// Requiring an ASIN dropped those books from the library entirely.
+func TestAuthorKeyFallsBackToName(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "B000AQ2A84", authorKey(audnexusPerson{ASIN: "B000AQ2A84", Name: "Douglas Adams"}))
+	assert.Equal(t, "name:douglas adams", authorKey(audnexusPerson{Name: "Douglas Adams"}))
+	assert.Equal(t, "name:douglas adams", authorKey(audnexusPerson{Name: " Douglas ADAMS "}))
+	assert.Empty(t, authorKey(audnexusPerson{}))
+
+	name, ok := authorName("name:douglas adams")
+	assert.True(t, ok)
+	assert.Equal(t, "douglas adams", name)
+
+	_, ok = authorName("B000AQ2A84")
+	assert.False(t, ok)
+
+	// An author page only exists for a real ASIN.
+	assert.Empty(t, authorURL("name:douglas adams"))
+	assert.NotEmpty(t, authorURL("B000AQ2A84"))
+}
+
+// TestBookWithoutAuthorASIN is the Hitchhiker's Guide case: a real author, no
+// ASIN. The book must still map rather than being dropped.
+func TestBookWithoutAuthorASIN(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	book := testBook(testASIN(t))
+	book.Authors = []audnexusPerson{{Name: "Douglas Adams"}}
+
+	work, err := g.mapBook(ctx, book)
+	require.NoError(t, err)
+
+	require.Len(t, work.Authors, 1)
+	assert.Equal(t, "Douglas Adams", work.Authors[0].Name)
+	assert.NotZero(t, work.Authors[0].ForeignID)
+
+	ref, err := g.ids.Ref(ctx, work.Authors[0].ForeignID)
+	require.NoError(t, err)
+	assert.Equal(t, "name:douglas adams", ref.asin)
 }
