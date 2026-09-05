@@ -311,6 +311,9 @@ func (h *Handler) bulkBook(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) getWorkID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
+	// Someone asked for this book specifically, so it's worth full detail.
+	ctx = WithDirectLookup(ctx)
+
 	workID, err := pathToID(r.URL.Path)
 	if err != nil {
 		h.error(w, err)
@@ -372,6 +375,9 @@ func cacheFor(w http.ResponseWriter, d time.Duration, varyParams bool) {
 // @param editionId path int true "Edition ID"
 func (h *Handler) getBookID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
+	// Someone asked for this book specifically, so it's worth full detail.
+	ctx = WithDirectLookup(ctx)
 
 	bookID, err := pathToID(r.URL.Path)
 	if err != nil {

@@ -106,6 +106,12 @@ func (g *ABGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 	}
 	g.rememberRatings(products)
 
+	// The client follows a search with /book/bulk over every result. Without
+	// the listing cached, each of those costs its own audnexus request, so one
+	// unidentified file during a library import spends ~26 requests instead of
+	// one.
+	g.rememberProducts(products)
+
 	results := []SearchResource{}
 	for _, p := range products {
 		if p.ASIN == "" || len(p.Authors) == 0 {
@@ -233,15 +239,44 @@ func (g *ABGetter) GetBook(ctx context.Context, bookID int64, saveEditions editi
 // saturates the upstream budget and starves interactive requests. The listing
 // that found those books already described them.
 func (g *ABGetter) workResource(ctx context.Context, asin string) (workResource, error) {
-	if p := g.product(asin); p != nil {
+	// A catalog listing describes a book well enough to identify and browse
+	// it, and it's already in hand. Spending a request per book to improve a
+	// description is what made an author refresh cost hundreds of them and a
+	// library import spend tens of thousands.
+	if p := g.product(asin); p != nil && !isDirectLookup(ctx) {
 		return g.mapBook(ctx, p.asBook())
 	}
 
 	book, err := g.client.GetBook(ctx, asin)
 	if err != nil {
+		// A listing is better than nothing if the detail lookup fails.
+		if p := g.product(asin); p != nil {
+			Log(ctx).Debug("falling back to catalog data", "asin", asin, "err", err)
+			return g.mapBook(ctx, p.asBook())
+		}
 		return workResource{}, fmt.Errorf("getting book %s: %w", asin, err)
 	}
+
+	// Full detail supersedes the listing, so later reads don't downgrade.
+	g.forgetProduct(asin)
+
 	return g.mapBook(ctx, book)
+}
+
+// directLookupKey marks a request for one specific book, as opposed to a bulk
+// load or a background refresh.
+type directLookupKey struct{}
+
+// WithDirectLookup marks a request as asking for a single book by ID, which is
+// what the client does when someone actually opens one. Those get full detail;
+// everything else is served from the catalog listing that found it.
+func WithDirectLookup(ctx context.Context) context.Context {
+	return context.WithValue(ctx, directLookupKey{}, true)
+}
+
+func isDirectLookup(ctx context.Context) bool {
+	direct, _ := ctx.Value(directLookupKey{}).(bool)
+	return direct
 }
 
 // rememberRatings records rating detail from a catalog response. Ratings ride
@@ -269,6 +304,13 @@ func (g *ABGetter) rememberProducts(products []audibleProduct) {
 			g.products[p.ASIN] = &p
 		}
 	}
+}
+
+// forgetProduct drops a cached listing once fuller detail has been fetched.
+func (g *ABGetter) forgetProduct(asin string) {
+	g.productMu.Lock()
+	defer g.productMu.Unlock()
+	delete(g.products, asin)
 }
 
 // product returns a cached catalog entry for an ASIN, if one was seen.

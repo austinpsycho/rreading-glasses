@@ -663,3 +663,52 @@ func TestSearchRecordsAuthorName(t *testing.T) {
 	assert.Equal(t, "name:david ludwig", ref.asin)
 	assert.Equal(t, "David Ludwig", ref.label)
 }
+
+// TestSearchCachesProducts covers the library-import hot path. The client
+// follows a search with /book/bulk over every result, so without the listing
+// cached each result costs its own audnexus request -- roughly 26 per
+// unidentified file rather than one.
+func TestSearchCachesProducts(t *testing.T) {
+	g := newTestAudibleGetter(t)
+
+	asin := testASIN(t)
+	assert.Nil(t, g.product(asin))
+
+	g.rememberProducts([]audibleProduct{{
+		ASIN:    asin,
+		Title:   "The Final Empire",
+		Authors: []audnexusPerson{{ASIN: "B001IGFHW6", Name: "Brandon Sanderson"}},
+	}})
+
+	require.NotNil(t, g.product(asin))
+	assert.Equal(t, "The Final Empire", g.product(asin).Title)
+}
+
+// TestDirectLookupBypassesCatalogCache covers the other half: a bulk load or
+// background refresh is served from the listing, but opening one book gets the
+// fuller record. The test client points at a host that doesn't resolve, so a
+// direct lookup fails rather than silently taking the cheap path.
+func TestDirectLookupBypassesCatalogCache(t *testing.T) {
+	ids, cache := testDeps(t)
+
+	g, err := NewAudibleGetter(cache, NewAudibleClient("invalid.invalid", "invalid.invalid", "us", 0), ids)
+	require.NoError(t, err)
+
+	asin := testASIN(t)
+	g.rememberProducts([]audibleProduct{{
+		ASIN:    asin,
+		Title:   "The Final Empire",
+		Authors: []audnexusPerson{{Name: "Brandon Sanderson"}},
+	}})
+
+	// Bulk and refresh paths use the listing.
+	work, err := g.workResource(t.Context(), asin)
+	require.NoError(t, err)
+	assert.Equal(t, "The Final Empire", work.Title)
+
+	// A direct lookup tries audnexus first. It can't reach it here, so it
+	// falls back to the listing rather than failing the request outright.
+	work, err = g.workResource(WithDirectLookup(t.Context()), asin)
+	require.NoError(t, err)
+	assert.Equal(t, "The Final Empire", work.Title, "a failed detail fetch falls back to the listing")
+}
