@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/mock/gomock"
 )
 
@@ -504,5 +505,78 @@ func waitForDenorm(ctrl *Controller) {
 		time.Sleep(1 * time.Second)
 	} else {
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestBackgroundRequestsDoNotQueueRefreshes covers the cascade that made an
+// idle server keep working for days after a single search.
+//
+// Loading a work ensures its author, and refreshing an author loads every one
+// of their works. Left ungated those two feed each other: one refresh reaches
+// every co-author and anthology contributor in a catalog, each of those
+// reaches more, and the queue grows faster than it drains. Only a request
+// somebody is waiting on may queue a refresh.
+func TestBackgroundRequestsDoNotQueueRefreshes(t *testing.T) {
+	t.Parallel()
+
+	c := gomock.NewController(t)
+	getter := NewMockgetter(c)
+
+	const (
+		wantedID     = int64(1000)
+		incidentalID = int64(2000)
+	)
+
+	authorBytes := func(id int64) []byte {
+		out, err := json.Marshal(AuthorResource{ForeignID: id})
+		require.NoError(t, err)
+		return out
+	}
+
+	getter.EXPECT().GetAuthor(gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ context.Context, authorID int64) ([]byte, error) {
+			return authorBytes(authorID), nil
+		})
+
+	refreshed := make(chan int64, 8)
+
+	getter.EXPECT().GetAuthorBooks(gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ context.Context, authorID int64) iter.Seq[int64] {
+			refreshed <- authorID
+			return func(func(int64) bool) {}
+		})
+
+	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
+	require.NoError(t, err)
+
+	go ctrl.Run(t.Context())
+	t.Cleanup(func() { ctrl.Shutdown(t.Context()) })
+
+	// Queued first, so a refresh for it would be picked up before the one
+	// below rather than racing it.
+	background := context.WithValue(t.Context(), middleware.RequestIDKey, "refresh-work-42")
+	_, _, err = ctrl.GetAuthor(background, incidentalID)
+	require.NoError(t, err)
+
+	_, _, err = ctrl.GetAuthor(t.Context(), wantedID)
+	require.NoError(t, err)
+
+	select {
+	case got := <-refreshed:
+		assert.Equal(t, wantedID, got, "refreshed the author nobody asked for")
+	case <-time.After(10 * time.Second):
+		t.Fatal("never refreshed the requested author")
+	}
+
+	// The author was still fetched and cached, so relationships still resolve.
+	// It just doesn't get its whole catalogue walked.
+	cached, ok := ctrl.cache.Get(t.Context(), AuthorKey(incidentalID))
+	assert.True(t, ok, "background request should still cache the author")
+	assert.Equal(t, authorBytes(incidentalID), cached)
+
+	select {
+	case got := <-refreshed:
+		t.Fatalf("queued a refresh for author %d from a background request", got)
+	default:
 	}
 }

@@ -692,13 +692,29 @@ func (c *Controller) getAuthor(ctx context.Context, authorID int64) (ttlpair, er
 		cachedBytes = authorBytes
 	}
 
-	// Mark the author as being refreshed by recording its last known state.
-	if err := c.persister.Persist(ctx, authorID, cachedBytes); err != nil {
-		Log(ctx).Warn("problem persisting refresh", "err", err)
-	}
+	// Only something a user is waiting on gets to queue a refresh.
+	//
+	// A refresh walks an author's whole catalog, and every book it loads
+	// ensures that book's own author -- which lands back here. With a source
+	// that returns full catalogs, anthologies and co-authored titles mean
+	// almost every author reaches dozens more, each of those reaches dozens
+	// more again, and the queue grows faster than it drains. The queue is
+	// persisted, so that outlives restarts: one search seeds work that is
+	// still running days later.
+	//
+	// Refreshing an author the client asked for is the useful part;
+	// refreshing everyone they have shared a cover with is not. The author is
+	// still fetched and cached above either way, so relationships are
+	// unaffected -- only the catalog walk is skipped.
+	if !isBackground(ctx) {
+		// Mark the author as being refreshed by recording its last known state.
+		if err := c.persister.Persist(ctx, authorID, cachedBytes); err != nil {
+			Log(ctx).Warn("problem persisting refresh", "err", err)
+		}
 
-	// Kick off a refresh but don't block on it.
-	c.refreshC <- refreshAuthor{id: authorID, state: cachedBytes}
+		// Kick off a refresh but don't block on it.
+		c.refreshC <- refreshAuthor{id: authorID, state: cachedBytes}
+	}
 
 	// Return the last cached value to give the refresh time to complete.
 	return ttlpair{bytes: cachedBytes, ttl: ttl}, nil
