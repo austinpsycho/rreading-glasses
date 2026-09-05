@@ -475,3 +475,56 @@ func TestWorkResourcePrefersProduct(t *testing.T) {
 	require.Len(t, work.Books, 1)
 	assert.Equal(t, asin, work.Books[0].Asin)
 }
+
+// TestAuthorIdentityNotMixed covers a co-authored book whose first credit has
+// no ASIN. The name and the ASIN must describe the same person: taking the
+// name from one entry and the ID from another files one author's books under
+// another author's name.
+func TestAuthorIdentityNotMixed(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	g.authors["B0COAUTHOR"] = &audnexusAuthor{ASIN: "B0COAUTHOR", Name: "Real Author"}
+
+	book := testBook(testASIN(t))
+	book.Authors = []audnexusPerson{
+		{Name: "Uncredited Contributor"}, // no ASIN
+		{ASIN: "B0COAUTHOR", Name: "Real Author"},
+	}
+
+	work, err := g.mapBook(ctx, book)
+	require.NoError(t, err)
+
+	author := work.Authors[0]
+	assert.Equal(t, "Real Author", author.Name, "name must match the ASIN it was minted from")
+
+	// The surrogate ID must belong to the same person as the name.
+	expected, err := g.ids.ID(ctx, kindAuthor, "B0COAUTHOR", "")
+	require.NoError(t, err)
+	assert.Equal(t, expected, author.ForeignID)
+
+	// And the recorded label must not be the other contributor's name.
+	ref, err := g.ids.Ref(ctx, author.ForeignID)
+	require.NoError(t, err)
+	assert.Equal(t, "B0COAUTHOR", ref.asin)
+	assert.NotEqual(t, "Uncredited Contributor", ref.label)
+}
+
+func TestPrimaryAuthor(t *testing.T) {
+	t.Parallel()
+
+	_, ok := primaryAuthor(nil)
+	assert.False(t, ok)
+
+	_, ok = primaryAuthor([]audnexusPerson{{Name: "No ASIN"}})
+	assert.False(t, ok)
+
+	a, ok := primaryAuthor([]audnexusPerson{
+		{Name: "Contributor"},
+		{ASIN: "B002", Name: "Author"},
+		{ASIN: "B003", Name: "Co-author"},
+	})
+	require.True(t, ok)
+	assert.Equal(t, "B002", a.ASIN)
+	assert.Equal(t, "Author", a.Name, "name and ASIN must come from one entry")
+}

@@ -304,10 +304,11 @@ func (g *ABGetter) authorDetail(ctx context.Context, asin string) *audnexusAutho
 
 // mapBook translates an audnexus book into the client's work schema.
 func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResource, error) {
-	authASIN := authorASIN(book.Authors)
-	if authASIN == "" {
+	primary, ok := primaryAuthor(book.Authors)
+	if !ok {
 		return workResource{}, errors.Join(errNotFound, fmt.Errorf("book %s has no author", book.ASIN))
 	}
+	authASIN := primary.ASIN
 
 	workID, err := g.ids.ID(ctx, kindWork, book.ASIN, book.Title)
 	if err != nil {
@@ -317,7 +318,7 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 	if err != nil {
 		return workResource{}, err
 	}
-	authorID, err := g.ids.ID(ctx, kindAuthor, authASIN, book.Authors[0].Name)
+	authorID, err := g.ids.ID(ctx, kindAuthor, authASIN, primary.Name)
 	if err != nil {
 		return workResource{}, err
 	}
@@ -397,7 +398,7 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 
 	authorRsc := AuthorResource{
 		ForeignID:   authorID,
-		Name:        book.Authors[0].Name,
+		Name:        primary.Name,
 		Description: "N/A", // Must be set.
 		URL:         audibleURL(authASIN),
 		Series:      series,
@@ -508,6 +509,16 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 		work, err := g.workResource(ctx, p.ASIN)
 		if err != nil {
 			Log(ctx).Debug("skipping unloadable work for author", "asin", p.ASIN, "err", err)
+			continue
+		}
+
+		// mapBook credits a work to its primary author, which on a
+		// co-authored book may not be the author being requested. Adopting it
+		// anyway would return this author's name and bio attached to another
+		// author's ID and bibliography.
+		if len(work.Authors) == 0 || work.Authors[0].ForeignID != authorID {
+			Log(ctx).Debug("skipping work credited to another author",
+				"asin", p.ASIN, "authorID", authorID)
 			continue
 		}
 
@@ -655,15 +666,26 @@ func (g *ABGetter) Recommendations(ctx context.Context, page int64) (Recommentat
 	return RecommentationsResource{WorkIDs: []int64{}}, nil
 }
 
-// authorASIN returns the first author with an ASIN. Audible lists co-authors
-// and occasionally credits contributors without ASINs.
-func authorASIN(authors []audnexusPerson) string {
+// primaryAuthor returns the first credited author that has an ASIN.
+//
+// Both the name and the ASIN must come from the same entry. Audible credits
+// co-authors and contributors, and some of them have no ASIN, so taking the
+// name from the first entry and the ASIN from wherever one happens to appear
+// builds an identity out of two different people -- one author's name against
+// another author's ID and bibliography.
+func primaryAuthor(authors []audnexusPerson) (audnexusPerson, bool) {
 	for _, a := range authors {
 		if a.ASIN != "" {
-			return a.ASIN
+			return a, true
 		}
 	}
-	return ""
+	return audnexusPerson{}, false
+}
+
+// authorASIN returns the first author with an ASIN.
+func authorASIN(authors []audnexusPerson) string {
+	a, _ := primaryAuthor(authors)
+	return a.ASIN
 }
 
 func personNames(people []audnexusPerson) []string {
