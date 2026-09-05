@@ -10,9 +10,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/dgraph-io/ristretto/v2"
+	"github.com/go-chi/chi/v5/middleware"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
 )
@@ -31,26 +32,40 @@ type ABGetter struct {
 	client *AudibleClient
 	ids    *IDMapper
 
-	// authors caches author detail so mapping a book doesn't cost an upstream
-	// request per contributor -- a bulk load pulls many books by one author,
-	// and getters aren't allowed to write to the shared cache. Bounded by the
-	// number of distinct authors in a library, which is small.
-	authorMu sync.RWMutex
-	authors  map[string]*audnexusAuthor
+	// authors, ratings and products are bounded. An import touches hundreds of
+	// thousands of records, and holding every one for the life of the process
+	// is what makes memory climb until the container is killed. These are
+	// caches, not indexes -- a miss costs a request, not correctness.
+	authors  *ristretto.Cache[string, *audnexusAuthor]
+	ratings  *ristretto.Cache[string, *audibleRating]
+	products *ristretto.Cache[string, *audibleProduct]
+}
 
-	// ratings caches rating counts seen in catalog responses. audnexus omits
-	// them, and the client sorts search results by rating count -- with every
-	// count equal the sort is comparing a constant and the order it produces
-	// is arbitrary.
-	ratingMu sync.RWMutex
-	ratings  map[string]*audibleRating
+// Cache sizes are counted in entries. Products are the largest by far, holding
+// a full catalog record each, so they get the smallest allowance: they only
+// need to outlive the bulk load that follows a search or the walk that found
+// them.
+// authorFailureTTL is how long a failed author lookup is remembered. Long
+// enough that a rate limit isn't retried per book, short enough that a
+// transient failure doesn't leave an author blank.
+const authorFailureTTL = 10 * time.Minute
 
-	// products caches catalog entries seen while walking an author, so those
-	// books can be mapped without an audnexus request each. Only the author
-	// walk populates this: search returns few results and they're the most
-	// visible thing in the UI, so those keep full detail.
-	productMu sync.RWMutex
-	products  map[string]*audibleProduct
+const (
+	authorCacheSize  = 20_000
+	ratingCacheSize  = 100_000
+	productCacheSize = 25_000
+)
+
+func newRecordCache[V any](entries int64) *ristretto.Cache[string, V] {
+	c, err := ristretto.NewCache(&ristretto.Config[string, V]{
+		NumCounters: entries * 10,
+		MaxCost:     entries,
+		BufferItems: 64,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return c
 }
 
 var (
@@ -64,9 +79,9 @@ func NewAudibleGetter(cache cache[[]byte], client *AudibleClient, ids *IDMapper)
 		cache:    cache,
 		client:   client,
 		ids:      ids,
-		authors:  map[string]*audnexusAuthor{},
-		ratings:  map[string]*audibleRating{},
-		products: map[string]*audibleProduct{},
+		authors:  newRecordCache[*audnexusAuthor](authorCacheSize),
+		ratings:  newRecordCache[*audibleRating](ratingCacheSize),
+		products: newRecordCache[*audibleProduct](productCacheSize),
 	}, nil
 }
 
@@ -286,48 +301,44 @@ func isDirectLookup(ctx context.Context) bool {
 // along on searches and author listings we already make, so no extra request
 // is needed for the books a user actually sees.
 func (g *ABGetter) rememberRatings(products []audibleProduct) {
-	g.ratingMu.Lock()
-	defer g.ratingMu.Unlock()
-
 	for _, p := range products {
 		if p.ASIN != "" && p.Rating != nil {
-			g.ratings[p.ASIN] = p.Rating
+			g.ratings.Set(p.ASIN, p.Rating, 1)
 		}
 	}
+
+	g.ratings.Wait()
+}
+
+// rating returns cached rating detail for an ASIN, if it's been seen.
+func (g *ABGetter) rating(asin string) *audibleRating {
+	r, _ := g.ratings.Get(asin)
+	return r
 }
 
 // rememberProducts records catalog entries so an author's books can be mapped
 // without a per-book request.
 func (g *ABGetter) rememberProducts(products []audibleProduct) {
-	g.productMu.Lock()
-	defer g.productMu.Unlock()
-
 	for _, p := range products {
 		if p.ASIN != "" {
-			g.products[p.ASIN] = &p
+			g.products.Set(p.ASIN, &p, 1)
 		}
 	}
-}
 
-// forgetProduct drops a cached listing once fuller detail has been fetched.
-func (g *ABGetter) forgetProduct(asin string) {
-	g.productMu.Lock()
-	defer g.productMu.Unlock()
-	delete(g.products, asin)
+	// Sets are buffered, and the bulk load that follows a search reads these
+	// immediately -- without this it would miss and fetch each book instead.
+	g.products.Wait()
 }
 
 // product returns a cached catalog entry for an ASIN, if one was seen.
 func (g *ABGetter) product(asin string) *audibleProduct {
-	g.productMu.RLock()
-	defer g.productMu.RUnlock()
-	return g.products[asin]
+	p, _ := g.products.Get(asin)
+	return p
 }
 
-// rating returns cached rating detail for an ASIN, if it's been seen.
-func (g *ABGetter) rating(asin string) *audibleRating {
-	g.ratingMu.RLock()
-	defer g.ratingMu.RUnlock()
-	return g.ratings[asin]
+// forgetProduct drops a cached listing once fuller detail has been fetched.
+func (g *ABGetter) forgetProduct(asin string) {
+	g.products.Del(asin)
 }
 
 // mapBook translates an audnexus book into the client's work schema.
@@ -516,6 +527,17 @@ func (g *ABGetter) authorKeyOf(authors []audnexusPerson) string {
 	return authorKey(primary)
 }
 
+// isBackground reports whether this context belongs to a refresh or
+// denormalization rather than something a user is waiting on. The controller
+// tags those with its own request IDs.
+func isBackground(ctx context.Context) bool {
+	id := middleware.GetReqID(ctx)
+
+	return strings.HasPrefix(id, "refresh-") ||
+		strings.HasPrefix(id, "denorm-") ||
+		strings.HasPrefix(id, "save-editions-")
+}
+
 // authorIdentity returns the display name for an author key plus, when
 // audnexus can be matched to it, their bio and photo.
 //
@@ -546,28 +568,39 @@ func (g *ABGetter) authorIdentity(ctx context.Context, key, label string) (strin
 // returns two, one with a bio and photo and one with neither. Taking the first
 // leaves an author looking blank when their details were a request away.
 func (g *ABGetter) authorDetailByName(ctx context.Context, key, name string) *audnexusAuthor {
-	g.authorMu.RLock()
-	detail, ok := g.authors[key]
-	g.authorMu.RUnlock()
-	if ok {
+	if detail, ok := g.authors.Get(key); ok {
 		return detail
+	}
+
+	// Enrichment is a picture and a bio, and it costs a name search plus up to
+	// three record fetches. During an import that is thousands of authors the
+	// user may never look at, and audnexus starts refusing the traffic. Do it
+	// when someone is actually looking, not while walking catalogs in the
+	// background.
+	if isBackground(ctx) {
+		return nil
 	}
 
 	candidates, err := g.client.SearchAuthors(ctx, name)
 	if err != nil {
-		// A lookup that failed is not a lookup that found nothing. Caching it
-		// would leave the author blank for the life of the process over one
-		// rate-limited request.
+		// A failure isn't the same answer as "no such author", so it isn't
+		// remembered for good -- but not remembering it at all means retrying
+		// for every book by that author. Under a rate limit that turns one
+		// refused request into a storm that sustains itself: each retry adds
+		// load, the load causes more refusals, and every attempt holds a
+		// goroutine through its backoff. Remember it briefly instead.
 		Log(ctx).Debug("author search failed", "name", name, "err", err)
+		g.authors.SetWithTTL(key, nil, 1, authorFailureTTL)
+		g.authors.Wait()
+
 		return nil
 	}
 
-	detail = g.bestAuthorRecord(ctx, candidates, name)
+	detail := g.bestAuthorRecord(ctx, candidates, name)
 
-	// Nothing matched, which is a real answer and worth remembering.
-	g.authorMu.Lock()
-	g.authors[key] = detail
-	g.authorMu.Unlock()
+	// Nothing matched is a real answer and worth remembering.
+	g.authors.Set(key, detail, 1)
+	g.authors.Wait()
 
 	return detail
 }

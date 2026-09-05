@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -23,15 +25,19 @@ func newTestAudibleGetter(t *testing.T) *ABGetter {
 	// Seed author detail so mapping doesn't reach the network. Detail is keyed
 	// by author key, not ASIN. A nil entry is a cached miss, which is what an
 	// author audnexus has no record of looks like.
-	g.authors["name:brandon sanderson"] = &audnexusAuthor{
+	g.authors.Set("name:brandon sanderson", &audnexusAuthor{
 		ASIN:        "B001IGFHW6",
 		Name:        "Brandon Sanderson",
 		Description: "Epic fantasy author.",
 		Image:       "https://m.media-amazon.com/images/I/author.jpg",
-	}
-	g.authors["name:obscure author"] = nil
-	g.authors["name:henry james"] = nil
-	g.authors["name:david ludwig"] = nil
+	}, 1)
+	g.authors.Set("name:obscure author", nil, 1)
+	g.authors.Set("name:henry james", nil, 1)
+	g.authors.Set("name:david ludwig", nil, 1)
+
+	// ristretto applies Set through a buffer; without this the reads below
+	// race the writes.
+	g.authors.Wait()
 
 	return g
 }
@@ -448,7 +454,8 @@ func TestWorkResourcePrefersProduct(t *testing.T) {
 	require.NoError(t, err)
 
 	asin := testASIN(t)
-	g.authors["B001IGFHW6"] = &audnexusAuthor{ASIN: "B001IGFHW6", Name: "Brandon Sanderson"}
+	g.authors.Set("B001IGFHW6", &audnexusAuthor{ASIN: "B001IGFHW6", Name: "Brandon Sanderson"}, 1)
+	g.authors.Wait()
 	g.rememberProducts([]audibleProduct{{
 		ASIN:    asin,
 		Title:   "The Final Empire",
@@ -824,4 +831,49 @@ func TestAuthorWalkOnlyYieldsLedBooks(t *testing.T) {
 	assert.True(t, contributed.creditsAuthor(key, "Brandon Sanderson"))
 
 	_ = ctx
+}
+
+// TestFailedAuthorLookupIsRemembered pins the regression that made an idle
+// server generate constant traffic. A failed lookup that isn't remembered is
+// retried for every book by that author; under a rate limit that sustains
+// itself, since each retry adds load, the load causes more refusals, and every
+// attempt holds a goroutine through its backoff.
+func TestFailedAuthorLookupIsRemembered(t *testing.T) {
+	ids, cache := testDeps(t)
+
+	// A host that doesn't resolve, so the lookup fails rather than 404s.
+	g, err := NewAudibleGetter(cache, NewAudibleClient("invalid.invalid", "invalid.invalid", "us", 0), ids)
+	require.NoError(t, err)
+
+	key := "name:someone unreachable"
+
+	assert.Nil(t, g.authorDetailByName(t.Context(), key, "Someone Unreachable"))
+
+	_, remembered := g.authors.Get(key)
+	assert.True(t, remembered, "a failed lookup must be cached, or it retries per book")
+}
+
+// TestBackgroundSkipsAuthorEnrichment covers the other half. Enrichment is a
+// bio and a photo; during an import it would run for thousands of authors
+// nobody is looking at, which is what audnexus starts refusing.
+func TestBackgroundSkipsAuthorEnrichment(t *testing.T) {
+	ids, cache := testDeps(t)
+
+	g, err := NewAudibleGetter(cache, NewAudibleClient("invalid.invalid", "invalid.invalid", "us", 0), ids)
+	require.NoError(t, err)
+
+	background := context.WithValue(t.Context(), middleware.RequestIDKey, "refresh-author-1234")
+	assert.True(t, isBackground(background))
+
+	// Returns without reaching the network, and without caching a miss it
+	// would have to unlearn later.
+	assert.Nil(t, g.authorDetailByName(background, "name:nobody", "Nobody"))
+
+	_, remembered := g.authors.Get("name:nobody")
+	assert.False(t, remembered, "a skipped lookup is not an answer")
+
+	for _, id := range []string{"denorm-1-99", "save-editions-123", "refresh-work-5"} {
+		assert.True(t, isBackground(context.WithValue(t.Context(), middleware.RequestIDKey, id)), id)
+	}
+	assert.False(t, isBackground(context.WithValue(t.Context(), middleware.RequestIDKey, "abc123/xyz-000001")))
 }
