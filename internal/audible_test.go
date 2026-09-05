@@ -764,3 +764,28 @@ func TestAuthorRecordsMerge(t *testing.T) {
 		assert.Equal(t, "Literary Fiction", bare.Genres[0].Name)
 	})
 }
+
+// TestGetBookDoesNotSaveEditions pins the callback being ignored. It runs
+// GetAuthor to ensure the author is fetched, which can start a refresh that
+// fetches that author's books -- so calling it per book turns one fetch into a
+// cascade of goroutines that each start another.
+func TestGetBookDoesNotSaveEditions(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	asin := testASIN(t)
+	g.rememberProducts([]audibleProduct{{
+		ASIN:    asin,
+		Title:   "The Final Empire",
+		Authors: []audnexusPerson{{Name: "Brandon Sanderson"}},
+	}})
+
+	bookID, err := g.ids.ID(ctx, kindBook, asin, "The Final Empire")
+	require.NoError(t, err)
+
+	called := 0
+	_, _, _, err = g.GetBook(ctx, bookID, func(...workResource) { called++ })
+	require.NoError(t, err)
+
+	assert.Zero(t, called, "GetBook must not run the editions callback")
+}

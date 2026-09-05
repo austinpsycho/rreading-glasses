@@ -202,7 +202,14 @@ func (g *ABGetter) GetWork(ctx context.Context, workID int64, saveEditions editi
 }
 
 // GetBook returns the work containing the edition for a surrogate book ID.
-func (g *ABGetter) GetBook(ctx context.Context, bookID int64, saveEditions editionsCallback) ([]byte, int64, int64, error) {
+//
+// The editions callback is deliberately ignored. It runs GetAuthor to ensure
+// the author is fetched, which can start a refresh, which fetches that
+// author's books -- so calling it per book turns one fetch into a cascade of
+// goroutines that each start another. A work here has exactly one edition and
+// GetWork already saves it, so there is nothing for this to add. The Hardcover
+// getter discards it for the same reason.
+func (g *ABGetter) GetBook(ctx context.Context, bookID int64, _ editionsCallback) ([]byte, int64, int64, error) {
 	asin, err := g.ids.ASIN(ctx, kindBook, bookID)
 	if err != nil {
 		return nil, 0, 0, err
@@ -217,10 +224,6 @@ func (g *ABGetter) GetBook(ctx context.Context, bookID int64, saveEditions editi
 	workRsc, err := g.workResource(ctx, asin)
 	if err != nil {
 		return nil, 0, 0, err
-	}
-
-	if saveEditions != nil {
-		saveEditions(workRsc)
 	}
 
 	out, err := json.Marshal(workRsc)
