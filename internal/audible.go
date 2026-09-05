@@ -574,16 +574,20 @@ func (g *ABGetter) authorDetailByName(ctx context.Context, key, name string) *au
 // enough that more requests won't settle it.
 const authorRecordCandidates = 3
 
-// bestAuthorRecord picks the fullest record among the exact name matches.
+// bestAuthorRecord combines the exact name matches into one record.
+//
+// The fullest match is the base, and anything it's missing is filled from the
+// others. Audible splits one person across several ASINs and audnexus keeps a
+// record per ASIN, so the bio and the photo are routinely on different ones --
+// picking either alone shows an author as half blank when both were available.
 func (g *ABGetter) bestAuthorRecord(ctx context.Context, candidates []audnexusAuthor, name string) *audnexusAuthor {
 	// The search is fuzzy -- "George Saunders" also returns "George Shipway"
 	// and "Scott George" -- so only an exact match on the normalized name
 	// counts.
 	want := normalizeAuthorName(name)
 
-	var best *audnexusAuthor
+	records := []*audnexusAuthor{}
 	seen := map[string]bool{}
-	checked := 0
 
 	for _, c := range candidates {
 		if c.ASIN == "" || seen[c.ASIN] || normalizeAuthorName(c.Name) != want {
@@ -591,24 +595,59 @@ func (g *ABGetter) bestAuthorRecord(ctx context.Context, candidates []audnexusAu
 		}
 		seen[c.ASIN] = true
 
-		if checked >= authorRecordCandidates {
+		if len(records) >= authorRecordCandidates {
 			break
 		}
-		checked++
 
 		full, err := g.client.GetAuthor(ctx, c.ASIN)
 		if err != nil {
 			continue
 		}
+		records = append(records, full)
+	}
 
-		// A record with a bio and a photo is what the client displays, so
-		// prefer it over an emptier one for the same person.
-		if best == nil || authorRecordScore(full) > authorRecordScore(best) {
-			best = full
+	if len(records) == 0 {
+		return nil
+	}
+
+	// Start from the fullest so its identity and its longer text win, then
+	// take whatever it lacks from the rest.
+	best := 0
+	for i, r := range records {
+		if authorRecordScore(r) > authorRecordScore(records[best]) {
+			best = i
 		}
 	}
 
-	return best
+	merged := *records[best]
+
+	for i, r := range records {
+		if i == best {
+			continue
+		}
+		fillAuthorGaps(&merged, r)
+	}
+
+	return &merged
+}
+
+// fillAuthorGaps copies anything dst is missing from src.
+func fillAuthorGaps(dst *audnexusAuthor, src *audnexusAuthor) {
+	if dst.Description == "" {
+		dst.Description = src.Description
+	}
+	if dst.Image == "" {
+		dst.Image = src.Image
+	}
+	if len(dst.Genres) == 0 {
+		dst.Genres = src.Genres
+	}
+	if dst.Name == "" {
+		dst.Name = src.Name
+	}
+	if dst.ASIN == "" {
+		dst.ASIN = src.ASIN
+	}
 }
 
 // authorRecordScore ranks how much an audnexus record actually says.

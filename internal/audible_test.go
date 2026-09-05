@@ -730,3 +730,37 @@ func TestAuthorRecordScore(t *testing.T) {
 	assert.Greater(t, authorRecordScore(imageOnly), authorRecordScore(empty))
 	assert.Equal(t, 0, authorRecordScore(empty))
 }
+
+// TestAuthorRecordsMerge covers combining several records for one author.
+// Audible splits a person across ASINs and audnexus keeps a record per ASIN,
+// so the bio and the photo routinely sit on different ones; taking either
+// alone leaves the author half blank.
+func TestAuthorRecordsMerge(t *testing.T) {
+	t.Parallel()
+
+	withBio := &audnexusAuthor{ASIN: "B0BIO", Name: "George Saunders", Description: "Writes short stories."}
+	withImage := &audnexusAuthor{ASIN: "B0IMG", Name: "George Saunders", Image: "https://example.invalid/a.jpg"}
+
+	merged := *withBio
+	fillAuthorGaps(&merged, withImage)
+
+	assert.Equal(t, "Writes short stories.", merged.Description)
+	assert.Equal(t, "https://example.invalid/a.jpg", merged.Image)
+	assert.Equal(t, "B0BIO", merged.ASIN, "the base record keeps its identity")
+
+	t.Run("does not overwrite what's already there", func(t *testing.T) {
+		other := &audnexusAuthor{Description: "Different bio.", Image: "https://example.invalid/b.jpg"}
+		fillAuthorGaps(&merged, other)
+
+		assert.Equal(t, "Writes short stories.", merged.Description)
+		assert.Equal(t, "https://example.invalid/a.jpg", merged.Image)
+	})
+
+	t.Run("fills genres too", func(t *testing.T) {
+		bare := audnexusAuthor{Name: "George Saunders"}
+		fillAuthorGaps(&bare, &audnexusAuthor{Genres: []audnexusGenre{{Name: "Literary Fiction"}}})
+
+		require.Len(t, bare.Genres, 1)
+		assert.Equal(t, "Literary Fiction", bare.Genres[0].Name)
+	})
+}
