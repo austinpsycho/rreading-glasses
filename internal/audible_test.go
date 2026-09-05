@@ -585,8 +585,8 @@ func TestAuthorKeyFallsBackToName(t *testing.T) {
 	_, ok = authorName("B000AQ2A84")
 	assert.False(t, ok)
 
-	// An author page only exists for a real ASIN.
-	assert.Empty(t, authorURL("name:douglas adams"))
+	// Both forms must produce a link; see TestAuthorURLNeverEmpty.
+	assert.NotEmpty(t, authorURL("name:douglas adams"))
 	assert.NotEmpty(t, authorURL("B000AQ2A84"))
 }
 
@@ -609,4 +609,61 @@ func TestBookWithoutAuthorASIN(t *testing.T) {
 	ref, err := g.ids.Ref(ctx, work.Authors[0].ForeignID)
 	require.NoError(t, err)
 	assert.Equal(t, "name:douglas adams", ref.asin)
+}
+
+// TestAuthorURLNeverEmpty guards the client's add-author view, which reads
+// links[0].url without checking. The client only records a link when the URL
+// is non-empty, so an author with none crashes the page.
+func TestAuthorURLNeverEmpty(t *testing.T) {
+	t.Parallel()
+
+	assert.NotEmpty(t, authorURL("B000AQ2A84"))
+	assert.NotEmpty(t, authorURL("name:douglas adams"))
+	assert.Contains(t, authorURL("name:douglas adams"), "douglas+adams")
+}
+
+// TestAuthorAliasJoinsUntaggedTitles covers an author with a mix of credited
+// and uncredited titles. Both must resolve to one author: otherwise the
+// uncredited half forms a name-keyed twin, and the controller discards those
+// books from the real author as belonging to someone else.
+func TestAuthorAliasJoinsUntaggedTitles(t *testing.T) {
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	g.authors["B000APYNL2"] = &audnexusAuthor{ASIN: "B000APYNL2", Name: "Henry James"}
+
+	// A title that does carry the ASIN.
+	tagged := testBook(testASIN(t))
+	tagged.Authors = []audnexusPerson{{ASIN: "B000APYNL2", Name: "Henry James"}}
+
+	taggedWork, err := g.mapBook(ctx, tagged)
+	require.NoError(t, err)
+
+	// One that doesn't.
+	untagged := testBook(testASIN(t))
+	untagged.Authors = []audnexusPerson{{Name: "Henry James"}}
+
+	untaggedWork, err := g.mapBook(ctx, untagged)
+	require.NoError(t, err)
+
+	assert.Equal(t, taggedWork.Authors[0].ForeignID, untaggedWork.Authors[0].ForeignID,
+		"an untagged title must join the author it belongs to")
+}
+
+func TestAuthorKeyForPrefersKnownASIN(t *testing.T) {
+	g := newTestAudibleGetter(t)
+
+	// Unknown name: keyed by name.
+	assert.Equal(t, "name:someone new", g.authorKeyFor(audnexusPerson{Name: "Someone New"}))
+
+	g.rememberAlias("Douglas Adams", "B000AQ2A84")
+	assert.Equal(t, "B000AQ2A84", g.authorKeyFor(audnexusPerson{Name: "douglas adams"}))
+
+	// An explicit ASIN always wins over the alias.
+	assert.Equal(t, "B0H535WGMP",
+		g.authorKeyFor(audnexusPerson{ASIN: "B0H535WGMP", Name: "Douglas Adams"}))
+
+	// A name-derived key is never aliased to.
+	g.rememberAlias("Nobody", "name:nobody")
+	assert.Equal(t, "name:nobody", g.authorKeyFor(audnexusPerson{Name: "Nobody"}))
 }

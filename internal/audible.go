@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -47,6 +48,14 @@ type ABGetter struct {
 	// visible thing in the UI, so those keep full detail.
 	productMu sync.RWMutex
 	products  map[string]*audibleProduct
+
+	// aliases maps an author's name to their ASIN once we've seen one, so the
+	// titles where Audible omits it join the same author instead of forming a
+	// second, name-keyed one. Without this an author with a mix of credited and
+	// uncredited titles is split in two, and the controller then discards the
+	// uncredited half as belonging to somebody else.
+	aliasMu sync.RWMutex
+	aliases map[string]string
 }
 
 var (
@@ -63,6 +72,7 @@ func NewAudibleGetter(cache cache[[]byte], client *AudibleClient, ids *IDMapper)
 		authors:  map[string]*audnexusAuthor{},
 		ratings:  map[string]*audibleRating{},
 		products: map[string]*audibleProduct{},
+		aliases:  map[string]string{},
 	}, nil
 }
 
@@ -316,7 +326,11 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 	if !ok {
 		return workResource{}, errors.Join(errNotFound, fmt.Errorf("book %s has no author", book.ASIN))
 	}
-	authASIN := authorKey(primary)
+	// Mapping a credited title teaches the name, so an uncredited one mapped
+	// later joins this author instead of forming a twin.
+	g.rememberAlias(primary.Name, primary.ASIN)
+
+	authASIN := g.authorKeyFor(primary)
 
 	workID, err := g.ids.ID(ctx, kindWork, book.ASIN, book.Title)
 	if err != nil {
@@ -482,6 +496,47 @@ func (g *ABGetter) mapSeries(ctx context.Context, book *audnexusBook, workID int
 	return series, nil
 }
 
+// rememberAlias records that a name is known to belong to a real ASIN.
+func (g *ABGetter) rememberAlias(name, key string) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" || key == "" {
+		return
+	}
+	if _, isName := authorName(key); isName {
+		return // Only a real ASIN is worth aliasing to.
+	}
+
+	g.aliasMu.Lock()
+	defer g.aliasMu.Unlock()
+	g.aliases[name] = key
+}
+
+// rememberAliases records every credited author that carries an ASIN.
+func (g *ABGetter) rememberAliases(products []audibleProduct) {
+	for _, p := range products {
+		for _, a := range p.Authors {
+			g.rememberAlias(a.Name, a.ASIN)
+		}
+	}
+}
+
+// authorKeyFor returns the mapping key for a credit, preferring an ASIN we've
+// already seen for that name over a name-derived key.
+func (g *ABGetter) authorKeyFor(a audnexusPerson) string {
+	if a.ASIN != "" {
+		return a.ASIN
+	}
+
+	g.aliasMu.RLock()
+	known := g.aliases[strings.ToLower(strings.TrimSpace(a.Name))]
+	g.aliasMu.RUnlock()
+
+	if known != "" {
+		return known
+	}
+	return authorKey(a)
+}
+
 // authorIdentity resolves an author key to a display name, plus audnexus
 // detail when the key is a real ASIN. A name-keyed author has no audnexus
 // record to fetch.
@@ -511,11 +566,14 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 		return nil, errors.Join(errNotFound, fmt.Errorf("no detail for author %s", asin))
 	}
 
+	g.rememberAlias(name, asin)
+
 	products, _, err := g.client.ProductsByAuthor(ctx, name, 0)
 	if err != nil {
 		return nil, fmt.Errorf("getting author products: %w", err)
 	}
 	g.rememberRatings(products)
+	g.rememberAliases(products)
 
 	description := "N/A" // Must be set.
 	image := ""
@@ -582,6 +640,10 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 			return
 		}
 
+		// Claim the name before mapping any books, so this author's untagged
+		// titles resolve to them rather than minting a name-keyed twin.
+		g.rememberAlias(name, asin)
+
 		seen := map[string]bool{}
 
 		// Audible's page parameter is 0-indexed: page=1 skips the first
@@ -599,6 +661,7 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 			}
 			g.rememberRatings(products)
 			g.rememberProducts(products)
+			g.rememberAliases(products)
 
 			for _, p := range products {
 				if p.ASIN == "" || seen[p.ASIN] || !p.creditsAuthor(asin, name) {
@@ -772,10 +835,15 @@ func authorASIN(authors []audnexusPerson) string {
 	return authorKey(a)
 }
 
-// authorURL links to an author's Audible page when there's a real ASIN for it.
+// authorURL links to an author's Audible page, or to a search for them when
+// there's no ASIN to link to.
+//
+// This must never be empty. The client only records a link when the URL is
+// non-empty, and its add-author view reads links[0].url without checking, so
+// an author with no link crashes the page.
 func authorURL(key string) string {
-	if _, isName := authorName(key); isName {
-		return ""
+	if name, isName := authorName(key); isName {
+		return "https://www.audible.com/search?keywords=" + url.QueryEscape(name)
 	}
 	return audibleURL(key)
 }
