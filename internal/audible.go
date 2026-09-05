@@ -537,6 +537,11 @@ func (g *ABGetter) authorIdentity(ctx context.Context, key, label string) (strin
 }
 
 // authorDetailByName finds an author's audnexus record by name, once per key.
+//
+// Audible lists the same person under several ASINs and audnexus keeps a
+// record per ASIN, so an exact name match is not unique -- "George Saunders"
+// returns two, one with a bio and photo and one with neither. Taking the first
+// leaves an author looking blank when their details were a request away.
 func (g *ABGetter) authorDetailByName(ctx context.Context, key, name string) *audnexusAuthor {
 	g.authorMu.RLock()
 	detail, ok := g.authors[key]
@@ -545,30 +550,77 @@ func (g *ABGetter) authorDetailByName(ctx context.Context, key, name string) *au
 		return detail
 	}
 
-	detail = nil
 	candidates, err := g.client.SearchAuthors(ctx, name)
 	if err != nil {
-		Log(ctx).Debug("no author detail", "name", name, "err", err)
+		// A lookup that failed is not a lookup that found nothing. Caching it
+		// would leave the author blank for the life of the process over one
+		// rate-limited request.
+		Log(ctx).Debug("author search failed", "name", name, "err", err)
+		return nil
 	}
 
-	// The search is fuzzy -- "David Ludwig MD PhD" also returns "David M.L.
-	// Rabin MD PhD" -- so only an exact match on the normalized name counts.
-	want := normalizeAuthorName(name)
-	for _, c := range candidates {
-		if c.ASIN == "" || normalizeAuthorName(c.Name) != want {
-			continue
-		}
-		if full, err := g.client.GetAuthor(ctx, c.ASIN); err == nil {
-			detail = full
-		}
-		break
-	}
+	detail = g.bestAuthorRecord(ctx, candidates, name)
 
+	// Nothing matched, which is a real answer and worth remembering.
 	g.authorMu.Lock()
 	g.authors[key] = detail
 	g.authorMu.Unlock()
 
 	return detail
+}
+
+// authorRecordCandidates bounds how many records are fetched for one name.
+// Exact matches are usually one or two; anything beyond that is a name common
+// enough that more requests won't settle it.
+const authorRecordCandidates = 3
+
+// bestAuthorRecord picks the fullest record among the exact name matches.
+func (g *ABGetter) bestAuthorRecord(ctx context.Context, candidates []audnexusAuthor, name string) *audnexusAuthor {
+	// The search is fuzzy -- "George Saunders" also returns "George Shipway"
+	// and "Scott George" -- so only an exact match on the normalized name
+	// counts.
+	want := normalizeAuthorName(name)
+
+	var best *audnexusAuthor
+	seen := map[string]bool{}
+	checked := 0
+
+	for _, c := range candidates {
+		if c.ASIN == "" || seen[c.ASIN] || normalizeAuthorName(c.Name) != want {
+			continue
+		}
+		seen[c.ASIN] = true
+
+		if checked >= authorRecordCandidates {
+			break
+		}
+		checked++
+
+		full, err := g.client.GetAuthor(ctx, c.ASIN)
+		if err != nil {
+			continue
+		}
+
+		// A record with a bio and a photo is what the client displays, so
+		// prefer it over an emptier one for the same person.
+		if best == nil || authorRecordScore(full) > authorRecordScore(best) {
+			best = full
+		}
+	}
+
+	return best
+}
+
+// authorRecordScore ranks how much an audnexus record actually says.
+func authorRecordScore(a *audnexusAuthor) int {
+	score := 0
+	if a.Description != "" {
+		score += 2
+	}
+	if a.Image != "" {
+		score++
+	}
+	return score
 }
 
 // GetAuthor returns an author seeded with one of their works.

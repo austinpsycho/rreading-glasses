@@ -712,3 +712,21 @@ func TestDirectLookupBypassesCatalogCache(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "The Final Empire", work.Title, "a failed detail fetch falls back to the listing")
 }
+
+// TestAuthorRecordScore covers preferring the fuller of several records for
+// one author. Audible lists the same person under several ASINs and audnexus
+// keeps a record per ASIN, so an exact name match isn't unique: "George
+// Saunders" returns one with a bio and photo and one with neither.
+func TestAuthorRecordScore(t *testing.T) {
+	t.Parallel()
+
+	full := &audnexusAuthor{Description: "Writes short stories.", Image: "https://example.invalid/a.jpg"}
+	bioOnly := &audnexusAuthor{Description: "Writes short stories."}
+	imageOnly := &audnexusAuthor{Image: "https://example.invalid/a.jpg"}
+	empty := &audnexusAuthor{}
+
+	assert.Greater(t, authorRecordScore(full), authorRecordScore(bioOnly))
+	assert.Greater(t, authorRecordScore(bioOnly), authorRecordScore(imageOnly))
+	assert.Greater(t, authorRecordScore(imageOnly), authorRecordScore(empty))
+	assert.Equal(t, 0, authorRecordScore(empty))
+}
