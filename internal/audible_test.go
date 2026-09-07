@@ -1,11 +1,13 @@
 package internal
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -908,4 +910,44 @@ func TestRatingSurvivesEviction(t *testing.T) {
 	got := g.rating(ctx, asin)
 	require.NotNil(t, got, "rating was lost when the in-memory entry went away")
 	assert.Equal(t, int64(6001), got.OverallDistribution.NumRatings)
+}
+
+// TestAuthorIsCompleteOnFirstLoad covers the seam between a source that fills
+// an author in progressively and a client that treats the payload as the whole
+// truth. Books absent from it are deleted from the library, so seeding an
+// author with one work and backfilling the rest asynchronously does not read
+// as "still loading" -- it reads as "this author has one book", and empties a
+// shelf. Nothing in the payload distinguishes the two, and it is cached either
+// way.
+func TestAuthorIsCompleteOnFirstLoad(t *testing.T) {
+	t.Parallel()
+
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	g.authors.Set("name:robin hobb", nil, 1)
+	g.authors.Wait()
+
+	authorID, err := g.ids.ID(ctx, kindAuthor, "name:robin hobb", "Robin Hobb")
+	require.NoError(t, err)
+
+	out, err := g.GetAuthor(ctx, authorID)
+	require.NoError(t, err)
+
+	var rsc AuthorResource
+	require.NoError(t, json.Unmarshal(out, &rsc))
+
+	assert.Greater(t, len(rsc.Works), 15, "author arrived partially populated")
+
+	titles := map[string]bool{}
+	for _, w := range rsc.Works {
+		titles[w.ShortTitle] = true
+	}
+	assert.True(t, titles["Fool's Fate"], "dropped a book the author is credited with")
+
+	// The controller binary searches Works by ForeignID when denormalizing, so
+	// an unsorted payload silently loses or overwrites works.
+	assert.True(t, slices.IsSortedFunc(rsc.Works, func(a, b workResource) int {
+		return cmp.Compare(a.ForeignID, b.ForeignID)
+	}), "works must be sorted by ForeignID")
 }

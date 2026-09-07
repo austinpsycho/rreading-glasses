@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"iter"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -53,6 +55,11 @@ const authorFailureTTL = 10 * time.Minute
 // _ratingTTL is how long a rating is kept outside the in-memory cache.
 // Ratings move slowly and a stale one is harmless; an absent one is not.
 const _ratingTTL = 30 * 24 * time.Hour
+
+// maxAuthorWorks caps how many works one author payload carries. Audible
+// has a handful of accounts with thousands of listings, and the client has
+// to parse whatever we send in a single response.
+const maxAuthorWorks = 1000
 
 const (
 	authorCacheSize  = 20_000
@@ -750,13 +757,6 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 	if name == "" {
 		return nil, errors.Join(errNotFound, fmt.Errorf("no detail for author %s", asin))
 	}
-
-	products, _, err := g.client.ProductsByAuthor(ctx, name, 0)
-	if err != nil {
-		return nil, fmt.Errorf("getting author products: %w", err)
-	}
-	g.rememberRatings(ctx, products)
-
 	description := "N/A" // Must be set.
 	image := ""
 	if detail != nil {
@@ -766,37 +766,94 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 		image = detail.Image
 	}
 
-	// Seed the author with the first work we can actually load. The controller
-	// backfills the rest from GetAuthorBooks.
-	for _, p := range products {
-		// Seed with a book this author leads, for the same reason the walk
-		// only yields those.
-		if g.authorKeyOf(p.Authors) != asin {
-			continue
-		}
+	// Walk the whole catalog here rather than returning one work and leaving a
+	// background refresh to fill in the rest.
+	//
+	// The client treats an author payload as authoritative: books absent from
+	// it are deleted from the library. A partially populated author is
+	// therefore not merely incomplete, it is destructive -- and nothing in the
+	// payload distinguishes "still loading" from "this is all there is", so it
+	// gets cached as fact and served for as long as the entry lives.
+	//
+	// The staged design exists because walking an author is expensive against
+	// other sources. Against Audible it is one or two catalog pages, so buy
+	// correctness with the second it costs.
+	var (
+		works     []workResource
+		authorRsc AuthorResource
+		found     bool
+	)
 
-		work, err := g.workResource(ctx, p.ASIN)
+	seen := map[string]bool{}
+
+	for page := 0; ; page++ {
+		products, total, err := g.client.ProductsByAuthor(ctx, name, page)
 		if err != nil {
-			Log(ctx).Debug("skipping unloadable work for author", "asin", p.ASIN, "err", err)
-			continue
+			// Returning what we have so far would publish a partial author as
+			// though it were complete.
+			return nil, fmt.Errorf("getting author products: %w", err)
+		}
+		if len(products) == 0 {
+			break
 		}
 
-		// mapBook credits a work to its primary author, which on a
-		// co-authored book may not be the author being requested. Adopting it
-		// anyway would return this author's name and bio attached to another
-		// author's ID and bibliography.
-		if len(work.Authors) == 0 || work.Authors[0].ForeignID != authorID {
-			Log(ctx).Debug("skipping work credited to another author",
-				"asin", p.ASIN, "authorID", authorID)
-			continue
+		g.rememberRatings(ctx, products)
+		g.rememberProducts(products)
+
+		for _, p := range products {
+			// Only books this author leads, matching the walk.
+			if p.ASIN == "" || seen[p.ASIN] || g.authorKeyOf(p.Authors) != asin {
+				continue
+			}
+			seen[p.ASIN] = true
+
+			work, err := g.workResource(ctx, p.ASIN)
+			if err != nil {
+				Log(ctx).Debug("skipping unloadable work for author", "asin", p.ASIN, "err", err)
+				continue
+			}
+
+			// mapBook credits a work to its primary author, which on a
+			// co-authored book may not be the author being requested. Adopting
+			// it anyway would return this author's name and bio attached to
+			// another author's ID and bibliography.
+			if len(work.Authors) == 0 || work.Authors[0].ForeignID != authorID {
+				Log(ctx).Debug("skipping work credited to another author",
+					"asin", p.ASIN, "authorID", authorID)
+				continue
+			}
+
+			if !found {
+				authorRsc = work.Authors[0]
+				found = true
+			}
+
+			works = append(works, work)
+
+			if len(works) >= maxAuthorWorks {
+				Log(ctx).Warn("author has more works than we will serve", "authorID", authorID)
+				break
+			}
 		}
 
-		authorRsc := work.Authors[0]
+		if len(works) >= maxAuthorWorks || (page+1)*audiblePageSize >= total {
+			break
+		}
+	}
+
+	if found {
+		// The controller binary searches Works by ForeignID when denormalizing.
+		slices.SortFunc(works, func(a, b workResource) int {
+			return cmp.Compare(a.ForeignID, b.ForeignID)
+		})
+
 		authorRsc.Name = name
 		authorRsc.Description = description
 		authorRsc.ImageURL = image
 		authorRsc.URL = authorURL(asin)
-		authorRsc.Works = []workResource{work}
+		authorRsc.Works = works
+
+		Log(ctx).Debug("loaded author", "authorID", authorID, "works", len(works))
 
 		return json.Marshal(authorRsc)
 	}
