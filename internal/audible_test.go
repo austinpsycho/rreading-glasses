@@ -951,3 +951,40 @@ func TestAuthorIsCompleteOnFirstLoad(t *testing.T) {
 		return cmp.Compare(a.ForeignID, b.ForeignID)
 	}), "works must be sorted by ForeignID")
 }
+
+// TestAuthorCreditedTwoWays covers an author Audible credits under more than
+// one spelling. "Patrick M. Lencioni" and "Patrick Lencioni" are separate
+// keys, and audnexus canonicalises the first to the second. Querying the
+// catalog under the canonical name while filtering on the key we were asked
+// about yields a set where nothing matches, so the author renders with a bio
+// and a photo and no books, and the client reports the ID as not found.
+func TestAuthorCreditedTwoWays(t *testing.T) {
+	t.Parallel()
+
+	g := newTestAudibleGetter(t)
+	ctx := t.Context()
+
+	const key = "name:patrick lencioni"
+
+	// audnexus canonicalises to the spelling with the middle initial, which is
+	// what makes the query and the filter disagree: the catalog is asked for
+	// "Patrick M. Lencioni" and the results are checked against the key for
+	// "Patrick Lencioni".
+	g.authors.Set(key, &audnexusAuthor{
+		Name:        "Patrick M. Lencioni",
+		Description: "Founder of The Table Group.",
+	}, 1)
+	g.authors.Wait()
+
+	authorID, err := g.ids.ID(ctx, kindAuthor, key, "Patrick Lencioni")
+	require.NoError(t, err)
+
+	out, err := g.GetAuthor(ctx, authorID)
+	require.NoError(t, err, "author was credited books but resolved as not found")
+
+	var rsc AuthorResource
+	require.NoError(t, json.Unmarshal(out, &rsc))
+
+	assert.NotEmpty(t, rsc.Works, "author resolved with no books")
+	assert.Equal(t, "Patrick M. Lencioni", rsc.Name, "display name should be the canonical one")
+}

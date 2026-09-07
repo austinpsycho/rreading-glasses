@@ -585,22 +585,33 @@ func isBackground(ctx context.Context) bool {
 //
 // The lookup is enrichment only. Identity is already settled by the key, so a
 // miss costs a picture rather than changing which author this is.
-func (g *ABGetter) authorIdentity(ctx context.Context, key, label string) (string, *audnexusAuthor) {
-	name := label
-	if name == "" {
+func (g *ABGetter) authorIdentity(ctx context.Context, key, label string) (string, string, *audnexusAuthor) {
+	query := label
+	if query == "" {
 		normalized, _ := authorName(key)
-		name = titleCaseName(normalized)
+		query = titleCaseName(normalized)
 	}
-	if name == "" {
-		return "", nil
+	if query == "" {
+		return "", "", nil
 	}
 
-	detail := g.authorDetailByName(ctx, key, name)
+	name := query
+
+	detail := g.authorDetailByName(ctx, key, query)
 	if detail != nil && detail.Name != "" {
-		// audnexus has the author as they're actually written.
+		// audnexus has the author as they're actually written, which is what
+		// should be displayed -- but not what the catalog should be asked for.
+		//
+		// Audible credits the same person more than one way ("Patrick
+		// Lencioni" on 32 titles, "Patrick M. Lencioni" on 8), and each
+		// spelling is its own key. Querying the catalog under audnexus's
+		// canonical name while filtering on the key we were asked about
+		// returns a set where nothing matches: the author resolves, renders a
+		// bio and a photo, and has no books at all.
 		name = cleanAuthorName(detail.Name)
 	}
-	return name, detail
+
+	return name, query, detail
 }
 
 // authorDetailByName finds an author's audnexus record by name, once per key.
@@ -753,7 +764,7 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 
 	Log(ctx).Debug("getting author", "authorID", authorID, "asin", asin)
 
-	name, detail := g.authorIdentity(ctx, asin, ref.label)
+	name, query, detail := g.authorIdentity(ctx, asin, ref.label)
 	if name == "" {
 		return nil, errors.Join(errNotFound, fmt.Errorf("no detail for author %s", asin))
 	}
@@ -787,7 +798,7 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 	seen := map[string]bool{}
 
 	for page := 0; ; page++ {
-		products, total, err := g.client.ProductsByAuthor(ctx, name, page)
+		products, total, err := g.client.ProductsByAuthor(ctx, query, page)
 		if err != nil {
 			// Returning what we have so far would publish a partial author as
 			// though it were complete.
@@ -876,8 +887,8 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 		}
 		asin := ref.asin
 
-		name, _ := g.authorIdentity(ctx, asin, ref.label)
-		if name == "" {
+		_, query, _ := g.authorIdentity(ctx, asin, ref.label)
+		if query == "" {
 			Log(ctx).Warn("no identity for author", "asin", asin)
 			return
 		}
@@ -889,7 +900,7 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 		// page of books, and returns nothing at all for authors with fewer
 		// than num_results titles.
 		for page := 0; ; page++ {
-			products, total, err := g.client.ProductsByAuthor(ctx, name, page)
+			products, total, err := g.client.ProductsByAuthor(ctx, query, page)
 			if err != nil {
 				Log(ctx).Warn("problem getting author products", "asin", asin, "page", page, "err", err)
 				return
