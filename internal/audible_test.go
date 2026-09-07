@@ -877,3 +877,35 @@ func TestBackgroundSkipsAuthorEnrichment(t *testing.T) {
 	}
 	assert.False(t, isBackground(context.WithValue(t.Context(), middleware.RequestIDKey, "abc123/xyz-000001")))
 }
+
+// TestRatingSurvivesEviction covers a miss that costs correctness rather than
+// a request. The in-memory rating cache is bounded, and a book mapped without
+// its rating goes out with a count of zero -- which the client reads as
+// unpopular and drops, then caches that judgement with the work for weeks. One
+// eviction quietly removes a book from a library, so ratings are kept
+// somewhere they cannot be evicted.
+func TestRatingSurvivesEviction(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	g, err := NewAudibleGetter(newMemoryCache(), nil, nil)
+	require.NoError(t, err)
+
+	const asin = "B00MH3D5QY"
+
+	rating := &audibleRating{}
+	rating.OverallDistribution.NumRatings = 6001
+	rating.OverallDistribution.AverageRating = 4.8
+
+	g.rememberRatings(ctx, []audibleProduct{{ASIN: asin, Rating: rating}})
+
+	require.NotNil(t, g.rating(ctx, asin), "should be readable while cached in memory")
+
+	// Evict it, as the bounded cache does under load.
+	g.ratings.Clear()
+	g.ratings.Wait()
+
+	got := g.rating(ctx, asin)
+	require.NotNil(t, got, "rating was lost when the in-memory entry went away")
+	assert.Equal(t, int64(6001), got.OverallDistribution.NumRatings)
+}

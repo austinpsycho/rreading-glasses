@@ -50,6 +50,10 @@ type ABGetter struct {
 // transient failure doesn't leave an author blank.
 const authorFailureTTL = 10 * time.Minute
 
+// _ratingTTL is how long a rating is kept outside the in-memory cache.
+// Ratings move slowly and a stale one is harmless; an absent one is not.
+const _ratingTTL = 30 * 24 * time.Hour
+
 const (
 	authorCacheSize  = 20_000
 	ratingCacheSize  = 100_000
@@ -119,7 +123,7 @@ func (g *ABGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 	if err != nil {
 		return nil, fmt.Errorf("searching: %w", err)
 	}
-	g.rememberRatings(products)
+	g.rememberRatings(ctx, products)
 
 	// The client follows a search with /book/bulk over every result. Without
 	// the listing cached, each of those costs its own audnexus request, so one
@@ -300,20 +304,51 @@ func isDirectLookup(ctx context.Context) bool {
 // rememberRatings records rating detail from a catalog response. Ratings ride
 // along on searches and author listings we already make, so no extra request
 // is needed for the books a user actually sees.
-func (g *ABGetter) rememberRatings(products []audibleProduct) {
+func (g *ABGetter) rememberRatings(ctx context.Context, products []audibleProduct) {
 	for _, p := range products {
-		if p.ASIN != "" && p.Rating != nil {
-			g.ratings.Set(p.ASIN, p.Rating, 1)
+		if p.ASIN == "" || p.Rating == nil {
+			continue
+		}
+		g.ratings.Set(p.ASIN, p.Rating, 1)
+
+		// Also keep it somewhere it can't be evicted. A rating is small and
+		// changes slowly, and losing one is not the cheap miss the in-memory
+		// caches are sized for: a book mapped without its rating goes out with
+		// a count of zero, the client drops it for failing a minimum
+		// popularity, and the zero is then cached with the work for weeks. One
+		// eviction silently removes a book from a library.
+		if encoded, err := json.Marshal(p.Rating); err == nil {
+			g.cache.Set(ctx, ratingKey(p.ASIN), encoded, _ratingTTL)
 		}
 	}
 
 	g.ratings.Wait()
 }
 
-// rating returns cached rating detail for an ASIN, if it's been seen.
-func (g *ABGetter) rating(asin string) *audibleRating {
-	r, _ := g.ratings.Get(asin)
-	return r
+// ratingKey returns the persistent cache key for an ASIN's rating.
+func ratingKey(asin string) string {
+	return "rt" + asin
+}
+
+// rating returns rating detail for an ASIN, from memory or the durable cache.
+func (g *ABGetter) rating(ctx context.Context, asin string) *audibleRating {
+	if r, ok := g.ratings.Get(asin); ok && r != nil {
+		return r
+	}
+
+	encoded, ok := g.cache.Get(ctx, ratingKey(asin))
+	if !ok {
+		return nil
+	}
+
+	var r audibleRating
+	if err := json.Unmarshal(encoded, &r); err != nil {
+		return nil
+	}
+
+	g.ratings.Set(asin, &r, 1)
+
+	return &r
 }
 
 // rememberProducts records catalog entries so an author's books can be mapped
@@ -395,7 +430,7 @@ func (g *ABGetter) mapBook(ctx context.Context, book *audnexusBook) (workResourc
 	// the counts, which the client needs to order search results.
 	rating, _ := strconv.ParseFloat(book.Rating, 64)
 	ratingCount := int64(0)
-	if r := g.rating(book.ASIN); r != nil {
+	if r := g.rating(ctx, book.ASIN); r != nil {
 		ratingCount = r.OverallDistribution.NumRatings
 		if r.OverallDistribution.AverageRating > 0 {
 			rating = r.OverallDistribution.AverageRating
@@ -720,7 +755,7 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 	if err != nil {
 		return nil, fmt.Errorf("getting author products: %w", err)
 	}
-	g.rememberRatings(products)
+	g.rememberRatings(ctx, products)
 
 	description := "N/A" // Must be set.
 	image := ""
@@ -805,7 +840,7 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 			if len(products) == 0 {
 				return
 			}
-			g.rememberRatings(products)
+			g.rememberRatings(ctx, products)
 			g.rememberProducts(products)
 
 			for _, p := range products {
