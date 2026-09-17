@@ -1,6 +1,12 @@
 name: ci
 
 on:
+  # This fork develops on a long-lived branch and ships by tagging it, so
+  # without this nothing is ever tested: pull_request never fires, and the
+  # release workflow only builds and publishes.
+  push:
+    branches:
+      - audible
   pull_request:
     branches:
       - "*"
