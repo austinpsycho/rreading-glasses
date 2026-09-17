@@ -873,6 +873,10 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 	return nil, errors.Join(errNotFound, fmt.Errorf("no valid works for author %s", asin))
 }
 
+// AuthorsAreComplete reports that GetAuthor returns an author's whole
+// bibliography, so the controller's background refresh has nothing to add.
+func (g *ABGetter) AuthorsAreComplete() bool { return true }
+
 // GetAuthorBooks yields every edition ID credited to an author.
 //
 // Audible only filters the catalog by author name, so results are checked

@@ -580,3 +580,55 @@ func TestBackgroundRequestsDoNotQueueRefreshes(t *testing.T) {
 	default:
 	}
 }
+
+// TestCompleteAuthorsSkipTheRefresh covers the cost of running a backfill that
+// has nothing to backfill. The refresh exists for upstreams that hand back an
+// author a page at a time; against one whose GetAuthor is already complete it
+// walks the same catalog again and loads every book individually to rebuild
+// what it was just given. During an import that is dozens of concurrent walks,
+// which is enough upstream traffic to get rate limited.
+func TestCompleteAuthorsSkipTheRefresh(t *testing.T) {
+	t.Parallel()
+
+	c := gomock.NewController(t)
+	getter := completeMockGetter{NewMockgetter(c)}
+
+	const authorID = int64(1000)
+
+	out, err := json.Marshal(AuthorResource{ForeignID: authorID})
+	require.NoError(t, err)
+
+	getter.EXPECT().GetAuthor(gomock.Any(), authorID).AnyTimes().Return(out, nil)
+
+	walked := make(chan int64, 4)
+
+	getter.EXPECT().GetAuthorBooks(gomock.Any(), gomock.Any()).AnyTimes().
+		DoAndReturn(func(_ context.Context, id int64) iter.Seq[int64] {
+			walked <- id
+			return func(func(int64) bool) {}
+		})
+
+	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
+	require.NoError(t, err)
+
+	go ctrl.Run(t.Context())
+	t.Cleanup(func() { ctrl.Shutdown(t.Context()) })
+
+	got, _, err := ctrl.GetAuthor(t.Context(), authorID)
+	require.NoError(t, err)
+	assert.Equal(t, out, got, "the complete author should be returned as-is")
+
+	select {
+	case id := <-walked:
+		t.Fatalf("walked author %d again after GetAuthor already returned it whole", id)
+	case <-time.After(2 * time.Second):
+	}
+}
+
+// completeMockGetter is the generated mock plus the optional extension that
+// says its authors arrive whole.
+type completeMockGetter struct {
+	*Mockgetter
+}
+
+func (completeMockGetter) AuthorsAreComplete() bool { return true }

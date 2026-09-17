@@ -143,6 +143,15 @@ type asinLookup interface {
 	LookupASIN(ctx context.Context, asin string) (int64, error)
 }
 
+// completeAuthors is an optional getter extension for upstreams whose
+// GetAuthor already returns an author's whole bibliography. The background
+// refresh exists to backfill authors that arrive a page at a time; against a
+// getter that does not need it, the refresh walks the same catalog a second
+// time and loads every book individually to rebuild what it already has.
+type completeAuthors interface {
+	AuthorsAreComplete() bool
+}
+
 // NewUpstream creates a new http.Client with middleware appropriate for use
 // with an upstream.
 func NewUpstream(host string, proxy string) (*http.Client, error) {
@@ -733,6 +742,14 @@ func (c *Controller) getAuthor(ctx context.Context, authorID int64) (ttlpair, er
 	// refreshing everyone they have shared a cover with is not. The author is
 	// still fetched and cached above either way, so relationships are
 	// unaffected -- only the catalog walk is skipped.
+	// A getter that returns complete authors has nothing for the refresh to
+	// add. Running it anyway walks the catalog again and fetches every book to
+	// rebuild a payload we already hold, which during an import is dozens of
+	// concurrent walks and enough upstream traffic to get us rate limited.
+	if g, ok := c.getter.(completeAuthors); ok && g.AuthorsAreComplete() {
+		return ttlpair{bytes: authorBytes, ttl: ttl}, nil
+	}
+
 	if !isBackground(ctx) {
 		// Mark the author as being refreshed by recording its last known state.
 		if err := c.persister.Persist(ctx, authorID, cachedBytes); err != nil {
