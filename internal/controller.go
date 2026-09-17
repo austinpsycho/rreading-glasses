@@ -504,6 +504,21 @@ func (c *Controller) getWork(ctx context.Context, workID int64) (ttlpair, error)
 	ttl = fuzz(_workTTL, 1.5)
 	c.cache.Set(ctx, WorkKey(workID), workBytes, ttl)
 
+	// Whether to splice this work into its author, decided before the
+	// goroutine below detaches from the request.
+	//
+	// Doing it costs an author load, and against Audible that walks the
+	// author's entire catalog. A bulk hydrate runs this once per search
+	// result, so a single search turned into a couple of dozen concurrent
+	// catalog walks for authors nobody asked about -- which is what was
+	// getting us rate limited upstream.
+	//
+	// A search result is not evidence that anyone wants that author. Someone
+	// opening the book marks the request as a direct lookup and still gets
+	// the edge; until then the work stands on its own under its own key, and
+	// loading the author builds its Works list from the catalog regardless.
+	denormToAuthor := isDirectLookup(ctx)
+
 	// Ensuring relationships doesn't block.
 	go func() {
 		c.workG.Go(func() error {
@@ -526,13 +541,13 @@ func (c *Controller) getWork(ctx context.Context, workID int64) (ttlpair, error)
 				}
 			}
 
-			if authorID > 0 {
+			if authorID > 0 && denormToAuthor {
 				_, _, _ = c.GetAuthor(ctx, authorID) // Ensure fetched.
 			}
 
 			c.denormC <- edge{kind: workEdge, parentID: workID, childIDs: newSet(cachedBookIDs...)}
 
-			if authorID > 0 {
+			if authorID > 0 && denormToAuthor {
 				// Ensure the work belongs to its author.
 				c.denormC <- edge{kind: authorEdge, parentID: authorID, childIDs: newSet(workID)}
 			}
@@ -600,10 +615,22 @@ func (c *Controller) saveEditions(grBooks ...workResource) {
 				Log(ctx).Warn("missing author", "workID", w.ForeignID)
 				continue
 			}
+			// Deliberately not loading the author here.
+			//
+			// This used to fetch it "to ensure fetched", but a bulk hydrate
+			// calls GetWork once per search result and every one of those
+			// lands here, so a single search became a couple of dozen
+			// concurrent author loads -- and against Audible, loading an
+			// author walks their entire catalog. Authors who merely shared a
+			// results page with the query cost hundreds of upstream requests,
+			// which is what was getting us rate limited. GetBook already
+			// skips this callback for the same reason.
+			//
+			// Nothing below needs the author loaded: mapBook has already
+			// minted its ID, the edition is cached under its own key, and the
+			// work-edition edge never reads it. Whoever opens the book loads
+			// the author then.
 			authorID := w.Authors[0].ForeignID
-			if _, _, err := c.GetAuthor(ctx, authorID); err != nil { // Ensure fetched.
-				continue
-			}
 
 			if len(w.Books) == 0 {
 				Log(ctx).Warn("missing books", "workID", w.ForeignID)
