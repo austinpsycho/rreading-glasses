@@ -818,9 +818,16 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 			}
 			seen[p.ASIN] = true
 
-			work, err := g.workResource(ctx, p.ASIN)
+			// Map the listing we are holding rather than asking for it back by
+			// ASIN. workResource looks the product up in a bounded cache and
+			// falls through to audnexus on a miss, so with several author loads
+			// in flight the entries evict between the write and the read and
+			// every book becomes its own upstream request -- hundreds of them,
+			// for data already in memory, which is what earns the rate limit
+			// that then times the walk out.
+			work, err := g.mapBook(ctx, p.asBook())
 			if err != nil {
-				Log(ctx).Debug("skipping unloadable work for author", "asin", p.ASIN, "err", err)
+				Log(ctx).Debug("skipping unmappable work for author", "asin", p.ASIN, "err", err)
 				continue
 			}
 
