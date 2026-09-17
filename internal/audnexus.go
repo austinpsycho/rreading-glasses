@@ -287,7 +287,7 @@ func backoff(resp *http.Response, attempt int) time.Duration {
 }
 
 // GetBook fetches a single book from audnexus.
-func (c *AudibleClient) GetBook(ctx context.Context, asin string) (*audnexusBook, error) {
+func (c *AudibleClient) getBook(ctx context.Context, asin string) (*audnexusBook, error) {
 	var book audnexusBook
 	u := fmt.Sprintf("https://%s/books/%s?region=%s", c.audnexusHost, url.PathEscape(asin), c.region)
 	if err := c.get(ctx, c.audnexus, u, &book); err != nil {
@@ -300,7 +300,7 @@ func (c *AudibleClient) GetBook(ctx context.Context, asin string) (*audnexusBook
 }
 
 // GetAuthor fetches a single author from audnexus.
-func (c *AudibleClient) GetAuthor(ctx context.Context, asin string) (*audnexusAuthor, error) {
+func (c *AudibleClient) getAuthor(ctx context.Context, asin string) (*audnexusAuthor, error) {
 	var author audnexusAuthor
 	u := fmt.Sprintf("https://%s/authors/%s?region=%s", c.audnexusHost, url.PathEscape(asin), c.region)
 	if err := c.get(ctx, c.audnexus, u, &author); err != nil {
@@ -314,7 +314,7 @@ func (c *AudibleClient) GetAuthor(ctx context.Context, asin string) (*audnexusAu
 
 // SearchAuthors finds audnexus authors by name. Results are fuzzy and often
 // repeat the same author, so callers must match before trusting one.
-func (c *AudibleClient) SearchAuthors(ctx context.Context, name string) ([]audnexusAuthor, error) {
+func (c *AudibleClient) searchAuthors(ctx context.Context, name string) ([]audnexusAuthor, error) {
 	params := url.Values{}
 	params.Set("name", name)
 	params.Set("region", c.region)
@@ -328,7 +328,7 @@ func (c *AudibleClient) SearchAuthors(ctx context.Context, name string) ([]audne
 }
 
 // SearchProducts runs a natural language query against Audible's catalog.
-func (c *AudibleClient) SearchProducts(ctx context.Context, query string, limit int) ([]audibleProduct, error) {
+func (c *AudibleClient) searchProducts(ctx context.Context, query string, limit int) ([]audibleProduct, error) {
 	params := url.Values{}
 	params.Set("keywords", query)
 	params.Set("num_results", strconv.Itoa(limit))
@@ -348,7 +348,7 @@ func (c *AudibleClient) SearchProducts(ctx context.Context, query string, limit 
 // Audible only filters by author *name*, not ASIN, so results are filtered
 // against the expected ASIN by the caller — the response includes author ASINs,
 // which makes that exact rather than a name-match heuristic.
-func (c *AudibleClient) ProductsByAuthor(ctx context.Context, name string, page int) ([]audibleProduct, int, error) {
+func (c *AudibleClient) productsByAuthor(ctx context.Context, name string, page int) ([]audibleProduct, int, error) {
 	params := url.Values{}
 	params.Set("author", name)
 	params.Set("num_results", strconv.Itoa(audiblePageSize))

@@ -112,7 +112,7 @@ func (g *ABGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 
 	if _asin.MatchString(strings.ToUpper(query)) {
 		asin := strings.ToUpper(query)
-		book, err := g.client.GetBook(ctx, asin)
+		book, err := g.client.getBook(ctx, asin)
 		if err != nil {
 			// Fall through to a keyword search: an ASIN that isn't in this
 			// region may still match something by name.
@@ -126,7 +126,7 @@ func (g *ABGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 		}
 	}
 
-	products, err := g.client.SearchProducts(ctx, query, searchLimit)
+	products, err := g.client.searchProducts(ctx, query, searchLimit)
 	if err != nil {
 		return nil, fmt.Errorf("searching: %w", err)
 	}
@@ -188,7 +188,7 @@ func (g *ABGetter) searchResource(ctx context.Context, bookASIN, authASIN, authN
 // cache. The ASIN is verified against audnexus first so that a typo or an
 // out-of-region product doesn't mint an ID that resolves to nothing.
 func (g *ABGetter) LookupASIN(ctx context.Context, asin string) (int64, error) {
-	book, err := g.client.GetBook(ctx, strings.ToUpper(strings.TrimSpace(asin)))
+	book, err := g.client.getBook(ctx, strings.ToUpper(strings.TrimSpace(asin)))
 	if err != nil {
 		return 0, fmt.Errorf("looking up %s: %w", asin, err)
 	}
@@ -276,7 +276,7 @@ func (g *ABGetter) workResource(ctx context.Context, asin string) (workResource,
 		return g.mapBook(ctx, p.asBook())
 	}
 
-	book, err := g.client.GetBook(ctx, asin)
+	book, err := g.client.getBook(ctx, asin)
 	if err != nil {
 		// A listing is better than nothing if the detail lookup fails.
 		if p := g.product(asin); p != nil {
@@ -634,7 +634,7 @@ func (g *ABGetter) authorDetailByName(ctx context.Context, key, name string) *au
 		return nil
 	}
 
-	candidates, err := g.client.SearchAuthors(ctx, name)
+	candidates, err := g.client.searchAuthors(ctx, name)
 	if err != nil {
 		// A failure isn't the same answer as "no such author", so it isn't
 		// remembered for good -- but not remembering it at all means retrying
@@ -688,7 +688,7 @@ func (g *ABGetter) bestAuthorRecord(ctx context.Context, candidates []audnexusAu
 			break
 		}
 
-		full, err := g.client.GetAuthor(ctx, c.ASIN)
+		full, err := g.client.getAuthor(ctx, c.ASIN)
 		if err != nil {
 			continue
 		}
@@ -753,7 +753,7 @@ func authorRecordScore(a *audnexusAuthor) int {
 
 // GetAuthor returns an author seeded with one of their works.
 func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error) {
-	ref, err := g.ids.Ref(ctx, authorID)
+	ref, err := g.ids.ref(ctx, authorID)
 	if err != nil {
 		return nil, err
 	}
@@ -798,7 +798,7 @@ func (g *ABGetter) GetAuthor(ctx context.Context, authorID int64) ([]byte, error
 	seen := map[string]bool{}
 
 	for page := 0; ; page++ {
-		products, total, err := g.client.ProductsByAuthor(ctx, query, page)
+		products, total, err := g.client.productsByAuthor(ctx, query, page)
 		if err != nil {
 			// Returning what we have so far would publish a partial author as
 			// though it were complete.
@@ -891,7 +891,7 @@ func (g *ABGetter) AuthorsAreComplete() bool { return true }
 // who share a name from bleeding into each other.
 func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[int64] {
 	return func(yield func(int64) bool) {
-		ref, err := g.ids.Ref(ctx, authorID)
+		ref, err := g.ids.ref(ctx, authorID)
 		if err != nil || ref.kind != kindAuthor {
 			Log(ctx).Warn("unknown author ID", "authorID", authorID, "err", err)
 			return
@@ -911,7 +911,7 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 		// page of books, and returns nothing at all for authors with fewer
 		// than num_results titles.
 		for page := 0; ; page++ {
-			products, total, err := g.client.ProductsByAuthor(ctx, query, page)
+			products, total, err := g.client.productsByAuthor(ctx, query, page)
 			if err != nil {
 				Log(ctx).Warn("problem getting author products", "asin", asin, "page", page, "err", err)
 				return
@@ -959,7 +959,7 @@ func (g *ABGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 // therefore searched and the results filtered by series ASIN, which is exact
 // for everything the search surfaces but will miss entries it ranks poorly.
 func (g *ABGetter) GetSeries(ctx context.Context, seriesID int64) (*SeriesResource, error) {
-	ref, err := g.ids.Ref(ctx, seriesID)
+	ref, err := g.ids.ref(ctx, seriesID)
 	if err != nil {
 		return nil, err
 	}
@@ -970,7 +970,7 @@ func (g *ABGetter) GetSeries(ctx context.Context, seriesID int64) (*SeriesResour
 		return nil, errors.Join(errNotFound, fmt.Errorf("no title recorded for series %s", ref.asin))
 	}
 
-	products, err := g.client.SearchProducts(ctx, ref.label, audiblePageSize)
+	products, err := g.client.searchProducts(ctx, ref.label, audiblePageSize)
 	if err != nil {
 		return nil, fmt.Errorf("getting series %d: %w", seriesID, err)
 	}
@@ -1124,12 +1124,6 @@ func authorName(key string) (string, bool) {
 // _contributorRole matches the role Audible appends to a non-author credit.
 var _contributorRole = regexp.MustCompile(
 	`(?i) - (editor|translator|adaptation|adapted by|introduction|contributor|foreword|afterword|illustrator|narrator|preface|compiler|annotations?|notes)$`)
-
-// authorASIN returns the mapping key for a book's primary author.
-func authorASIN(authors []audnexusPerson) string {
-	a, _ := primaryAuthor(authors)
-	return authorKey(a)
-}
 
 // authorDisplayName returns the primary author's name as written.
 func authorDisplayName(authors []audnexusPerson) string {

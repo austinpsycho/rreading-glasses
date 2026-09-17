@@ -109,7 +109,7 @@ func TestIDMapper(t *testing.T) {
 	})
 
 	t.Run("records the label", func(t *testing.T) {
-		ref, err := m.Ref(ctx, bookID)
+		ref, err := m.ref(ctx, bookID)
 		require.NoError(t, err)
 		assert.Equal(t, "The Final Empire", ref.label)
 		assert.Equal(t, kindBook, ref.kind)
@@ -131,11 +131,11 @@ func TestIDMapper(t *testing.T) {
 	t.Run("reports unknown IDs as missing", func(t *testing.T) {
 		// This is what a client holding IDs from a different metadata source
 		// looks like, and it has to 404 rather than resolve to something else.
-		_, err := m.Ref(ctx, math.MaxInt32)
+		_, err := m.ref(ctx, math.MaxInt32)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, errNotFound)
 
-		_, err = m.Ref(ctx, 0)
+		_, err = m.ref(ctx, 0)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, errBadRequest)
 	})

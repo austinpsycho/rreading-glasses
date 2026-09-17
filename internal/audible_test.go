@@ -279,7 +279,7 @@ func TestAudibleSeriesTitleRecorded(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, work.Series, 1)
 
-	ref, err := g.ids.Ref(ctx, work.Series[0].ForeignID)
+	ref, err := g.ids.ref(ctx, work.Series[0].ForeignID)
 	require.NoError(t, err)
 	assert.Equal(t, kindSeries, ref.kind)
 	assert.Equal(t, "The Mistborn Saga", ref.label)
@@ -312,14 +312,15 @@ func TestAudibleReleaseDate(t *testing.T) {
 func TestNormalizeLanguage(t *testing.T) {
 	t.Parallel()
 
-	for in, want := range map[string]string{
-		"english":  "eng",
-		"English":  "eng",
-		" german ": "ger",
-		"japanese": "jpn",
-		"":         "",
-		"klingon":  "klingon", // Unknown values pass through rather than vanish.
+	for _, tc := range []struct{ in, want string }{
+		{"english", "eng"},
+		{"English", "eng"},
+		{" german ", "ger"}, // Surrounding whitespace is trimmed.
+		{"japanese", "jpn"},
+		{"", ""},
+		{"klingon", "klingon"}, // Unknown values pass through rather than vanish.
 	} {
+		in, want := tc.in, tc.want
 		assert.Equal(t, want, normalizeLanguage(in), "input %q", in)
 	}
 }
@@ -543,7 +544,7 @@ func TestBookWithoutAuthorASIN(t *testing.T) {
 	assert.Equal(t, "Douglas Adams", work.Authors[0].Name)
 	assert.NotZero(t, work.Authors[0].ForeignID)
 
-	ref, err := g.ids.Ref(ctx, work.Authors[0].ForeignID)
+	ref, err := g.ids.ref(ctx, work.Authors[0].ForeignID)
 	require.NoError(t, err)
 	assert.Equal(t, "name:douglas adams", ref.asin)
 }
@@ -667,7 +668,7 @@ func TestSearchRecordsAuthorName(t *testing.T) {
 	rsc, err := g.searchResource(ctx, testASIN(t), g.authorKeyOf(credits), authorDisplayName(credits))
 	require.NoError(t, err)
 
-	ref, err := g.ids.Ref(ctx, rsc.Author.ID)
+	ref, err := g.ids.ref(ctx, rsc.Author.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "name:david ludwig", ref.asin)
 	assert.Equal(t, "David Ludwig", ref.label)
@@ -807,11 +808,8 @@ func TestGetBookDoesNotSaveEditions(t *testing.T) {
 // co-authorship graph until it has covered most of the store.
 func TestAuthorWalkOnlyYieldsLedBooks(t *testing.T) {
 	g := newTestAudibleGetter(t)
-	ctx := t.Context()
 
 	led := audibleProduct{
-		ASIN:    testASIN(t),
-		Title:   "Their Own Book",
 		Authors: []audnexusPerson{{Name: "Brandon Sanderson"}},
 	}
 	contributed := audibleProduct{
@@ -831,8 +829,6 @@ func TestAuthorWalkOnlyYieldsLedBooks(t *testing.T) {
 
 	// Both still credit them, which is why matching on credit over-collects.
 	assert.True(t, contributed.creditsAuthor(key, "Brandon Sanderson"))
-
-	_ = ctx
 }
 
 // TestFailedAuthorLookupIsRemembered pins the regression that made an idle

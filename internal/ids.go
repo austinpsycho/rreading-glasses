@@ -112,7 +112,7 @@ LIMIT 1;`
 // Ref resolves a surrogate ID back to the ASIN it was minted for. It returns
 // errNotFound if the ID was never allocated, which is what happens when a
 // client asks for an ID left over from a different metadata source.
-func (m *IDMapper) Ref(ctx context.Context, id int64) (asinRef, error) {
+func (m *IDMapper) ref(ctx context.Context, id int64) (asinRef, error) {
 	if id == 0 {
 		return asinRef{}, errors.Join(errBadRequest, errors.New("missing ID"))
 	}
@@ -146,7 +146,7 @@ func (m *IDMapper) Ref(ctx context.Context, id int64) (asinRef, error) {
 // expected kind. Asking for a book ID with a work ID is a bug rather than a
 // missing record, so the kinds are checked rather than coerced.
 func (m *IDMapper) ASIN(ctx context.Context, kind idKind, id int64) (string, error) {
-	ref, err := m.Ref(ctx, id)
+	ref, err := m.ref(ctx, id)
 	if err != nil {
 		return "", err
 	}

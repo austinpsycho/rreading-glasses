@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/mock/gomock"
 )
 
